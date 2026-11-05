@@ -46,6 +46,7 @@ class JournalEntry:
     proposed_name: Optional[str] = None
     final_name: Optional[str] = None
     intended_final_path: Optional[str] = None   # 발행 중 의도한 최종 경로
+    expected_final_sha256: Optional[str] = None # 발행 중 산출물의 기대 SHA-256
     final_path: Optional[str] = None
     final_sha256: Optional[str] = None
     approved_by_user: bool = False
@@ -95,7 +96,12 @@ class JournalProtocol(Protocol):
        - OCR 및 제목 제안 추출 완료 기록 (REVIEW_PENDING)
     6. record_approved(input_rel: str, final_name: Optional[str] = None) -> JournalEntry
        - 사용자 검토/승인 및 확정 파일명 기록 (APPROVED)
-    7. record_publishing(input_rel: str, temp_path: Path, intended_final_path: Optional[str] = None) -> JournalEntry
+    7. record_publishing(
+           input_rel: str,
+           temp_path: Path,
+           intended_final_path: Optional[str] = None,
+           expected_final_sha256: Optional[str] = None,
+       ) -> JournalEntry
        - 대상 폴더 임시 파일 생성 및 검증 단계 기록 (PUBLISHING)
     8. record_published(input_rel: str, final_path: str, final_sha256: str) -> JournalEntry
        - 최종본 배치 완료 기록 (PUBLISHED)
@@ -109,7 +115,9 @@ class JournalProtocol(Protocol):
         - 실패 처리 및 사유 기록 (FAILED)
     13. record_undo(input_rel: str) -> JournalEntry
         - 실행 취소 및 롤백 기록 (DISCOVERED 등으로 전이)
-    14. export_ledger() -> dict
+    14. archive_completed_entry(input_rel: str) -> Optional[JournalEntry]
+        - 동일 이름의 새 파일 도착 시 기존 완료 엔트리를 히스토리로 아카이브
+    15. export_ledger() -> dict
         - scaninbox_corpus/schema/ledger.schema.json 호환 ledger 딕셔너리 반환
     """
 
@@ -143,6 +151,7 @@ class JournalProtocol(Protocol):
         input_rel: str,
         temp_path: Path,
         intended_final_path: Optional[str] = None,
+        expected_final_sha256: Optional[str] = None,
     ) -> JournalEntry: ...
     def record_published(
         self, input_rel: str, final_path: str, final_sha256: str
@@ -154,6 +163,7 @@ class JournalProtocol(Protocol):
     def record_held(self, input_rel: str, reason: str) -> JournalEntry: ...
     def record_failed(self, input_rel: str, reason: str) -> JournalEntry: ...
     def record_undo(self, input_rel: str) -> JournalEntry: ...
+    def archive_completed_entry(self, input_rel: str) -> Optional[JournalEntry]: ...
     def export_ledger(self) -> dict: ...
 
 
@@ -165,7 +175,7 @@ VALID_TRANSITIONS: dict[State, set[State]] = {
     State.EXTRACTED: {State.REVIEW_PENDING, State.FAILED, State.HELD},
     State.REVIEW_PENDING: {State.APPROVED, State.HELD, State.FAILED},
     State.APPROVED: {State.PUBLISHING, State.REVIEW_PENDING, State.HELD, State.FAILED},
-    State.PUBLISHING: {State.PUBLISHED, State.REVIEW_PENDING, State.APPROVED, State.FAILED},
+    State.PUBLISHING: {State.PUBLISHED, State.REVIEW_PENDING, State.APPROVED, State.HELD, State.FAILED},
     State.PUBLISHED: {State.SOURCE_CLEANUP_PENDING, State.COMPLETED, State.HELD, State.FAILED},
     State.SOURCE_CLEANUP_PENDING: {State.COMPLETED, State.HELD, State.FAILED},
     State.COMPLETED: {State.DISCOVERED},  # Undo 지원
@@ -200,6 +210,16 @@ class InMemoryJournal:
         if state is not None:
             items = [e for e in items if e.state == state]
         return sorted(items, key=lambda x: x.input_rel)
+
+    def archive_completed_entry(self, input_rel: str) -> Optional[JournalEntry]:
+        """동일 이름의 새 문서 도착 시 기존 완료 엔트리를 보존 아카이브."""
+        key = self._normalize_key(input_rel)
+        if key in self.entries and self.entries[key].state == State.COMPLETED:
+            old = self.entries.pop(key)
+            archive_key = f"{key}@{old.original_sha256[:8]}"
+            self.entries[archive_key] = old
+            return old
+        return None
 
     def record_discovered(
         self,
@@ -278,11 +298,14 @@ class InMemoryJournal:
         input_rel: str,
         temp_path: Path,
         intended_final_path: Optional[str] = None,
+        expected_final_sha256: Optional[str] = None,
     ) -> JournalEntry:
         entry = self.entries[self._normalize_key(input_rel)]
         self._transition(entry, State.PUBLISHING)
         if intended_final_path:
             entry.intended_final_path = intended_final_path
+        if expected_final_sha256:
+            entry.expected_final_sha256 = expected_final_sha256
         return entry
 
     def record_published(
@@ -325,6 +348,7 @@ class InMemoryJournal:
         entry.final_path = None
         entry.final_sha256 = None
         entry.intended_final_path = None
+        entry.expected_final_sha256 = None
         entry.approved_by_user = False
         return entry
 
@@ -395,6 +419,7 @@ class JsonFileJournal(InMemoryJournal):
                     proposed_name=item.get("proposed_name"),
                     final_name=item.get("final_name"),
                     intended_final_path=item.get("intended_final_path"),
+                    expected_final_sha256=item.get("expected_final_sha256"),
                     final_path=item.get("final_path"),
                     final_sha256=item.get("final_sha256"),
                     approved_by_user=item.get("approved_by_user", False),
@@ -418,6 +443,12 @@ class JsonFileJournal(InMemoryJournal):
         tmp = self.file_path.parent / f".tmp_{self.file_path.name}"
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.file_path)
+
+    def archive_completed_entry(self, *args: Any, **kwargs: Any) -> Optional[JournalEntry]:
+        res = super().archive_completed_entry(*args, **kwargs)
+        if res:
+            self._save()
+        return res
 
     def record_discovered(self, *args: Any, **kwargs: Any) -> JournalEntry:
         res = super().record_discovered(*args, **kwargs)
@@ -616,26 +647,31 @@ class Pipeline:
             rel_key = self._relative_key(path)
             actual_rel = path.relative_to(self.input_dir).as_posix()
             existing_entry = self.journal.get_entry(rel_key)
+            st = path.stat()
+            sha256 = compute_sha256(path)
 
-            # 이미 완료되었거나 보류/실패된 항목은 상태 유지
-            if existing_entry and existing_entry.state in (
-                State.COMPLETED,
-                State.HELD,
-                State.FAILED,
-            ):
+            # 이미 완료된 파일명으로 새 문서가 도착한 경우 (Codex finding 4 해결)
+            if existing_entry and existing_entry.state == State.COMPLETED:
+                if existing_entry.original_sha256 == sha256:
+                    # 동일 내용의 기완료 파일이면 스킵
+                    continue
+                else:
+                    # 다른 내용의 새 문서 도착: 기존 완료 항목을 아카이브하고 새 등록 진행
+                    self.journal.archive_completed_entry(rel_key)
+                    existing_entry = None
+
+            # 이미 보류/실패된 항목
+            if existing_entry and existing_entry.state in (State.HELD, State.FAILED):
                 continue
 
-            # 재스캔 시 이미 등록되어 검토/승인 대기 중인 항목 처리 (Codex finding 3 해결)
+            # 재스캔 시 이미 등록되어 검토/승인 대기 중인 항목 처리 (Codex finding 3 해결: REVIEW_PENDING, APPROVED 만 재사용)
             if existing_entry and existing_entry.state in (
                 State.REVIEW_PENDING,
                 State.APPROVED,
-                State.BACKED_UP,
-                State.EXTRACTED,
             ):
-                st = path.stat()
                 if (
                     st.st_size == existing_entry.original_size
-                    and compute_sha256(path) == existing_entry.original_sha256
+                    and sha256 == existing_entry.original_sha256
                 ):
                     item = PlanItem(
                         input_rel=rel_key,
@@ -660,8 +696,6 @@ class Pipeline:
 
             # 1. 안정성 검사
             stable = self._is_file_stable(path)
-            st = path.stat()
-            sha256 = compute_sha256(path)
 
             # 2. 등록 (Registration)
             entry = self.journal.record_discovered(
@@ -675,26 +709,26 @@ class Pipeline:
             # 3. 보호 (Backup)
             backup_target = self.backup_dir / actual_rel
             backup_target.parent.mkdir(parents=True, exist_ok=True)
-            if not backup_target.exists():
+            # 이미 백업이 존재하고 해시가 일치하면 재복사 생략 (BACKED_UP 상태에서 중단 후 재개 시)
+            if not backup_target.exists() or compute_sha256(backup_target) != sha256:
                 shutil.copy2(path, backup_target)
             backup_sha256 = compute_sha256(backup_target)
             if backup_sha256 != sha256:
                 reason = "백업 해시 불일치 (복사 중 파일 변경 의심)"
                 self.journal.record_failed(rel_key, reason=reason)
                 continue
-            self.journal.record_backed_up(
-                rel_key, backup_path=backup_target, backup_sha256=backup_sha256
-            )
+            if entry.state == State.DISCOVERED or entry.state == State.WAITING_STABLE:
+                self.journal.record_backed_up(
+                    rel_key, backup_path=backup_target, backup_sha256=backup_sha256
+                )
 
             # 4. 추출 (OCR & 제목)
+            # OCR 엔진 미설정 시 fail-closed 정책 (Codex finding 1 해결: OCR 필수이므로 엔진 없이 성공 위장 금지)
             if self.ocr_engine is None:
-                # 엔진이 주입되지 않은 기본 스텁 동작: ALREADY_TEXT 가정
                 ocr_res = OcrResult(
-                    status=OcrStatus.ALREADY_TEXT,
-                    output=backup_target,
-                    page_count_in=1,
-                    page_count_out=1,
-                    text_by_page=["스캔 문서 기본 내용"],
+                    status=OcrStatus.FAILED,
+                    reason="OCR 엔진 미설정: OCR 필수 정책에 따라 엔진 없이 완료할 수 없습니다.",
+                    engine="none",
                 )
             else:
                 tmp_out = self.work_dir / f"ocr_{sha256[:12]}"
@@ -728,7 +762,6 @@ class Pipeline:
                     pdf_for_title, ocr_res.text_by_page
                 )
             else:
-                # 기본 제목 제안
                 title_prop = TitleProposal(
                     title=path.stem,
                     evidence_page=1,
@@ -784,7 +817,6 @@ class Pipeline:
     def plan(self) -> list[PlanItem]:
         """현재 제안 계획 조회 (입력 폴더 무변경 보장)."""
         entries = self.journal.list_entries()
-        # 아직 저널에 등록된 항목이 없으면 scan() 호출
         if not entries:
             return self.scan()
 
@@ -817,7 +849,6 @@ class Pipeline:
         entry = self.journal.get_entry(key)
         if not entry:
             raise KeyError(f"저널에 존재하지 않는 파일입니다: {input_rel}")
-        # 파일명 안전화 검증
         if not new_name.lower().endswith(".pdf"):
             new_name = f"{new_name}.pdf"
         sanitized = sanitize_filename(new_name[:-4]) + ".pdf"
@@ -846,7 +877,6 @@ class Pipeline:
         dest = self.done_dir / f"{stem}.pdf"
         if not dest.exists():
             return dest
-        # 충돌 시 접미사 부여 (__1, __2, ...)
         counter = 1
         while True:
             candidate = self.done_dir / f"{stem}__{counter}.pdf"
@@ -885,7 +915,7 @@ class Pipeline:
 
         applied: list[str] = []
         for entry in candidates:
-            # 실제 입력 파일 경로 조회 (Codex finding 4 해결)
+            # 실제 입력 파일 경로 조회
             src_input = self._resolve_input_path(entry.input_rel, entry.actual_input_rel)
             if not src_input or not src_input.exists():
                 raise FileNotFoundError(
@@ -919,13 +949,6 @@ class Pipeline:
                 "NFC", safe_target.relative_to(self.done_dir).as_posix()
             )
             temp_target = self.done_dir / f".tmp_{safe_target.name}"
-
-            # 의도한 최종 배치 경로를 기록해 크래시 복구 시 중복 파일 방지 (Codex finding 5 해결)
-            self.journal.record_publishing(
-                entry.input_rel,
-                temp_path=temp_target,
-                intended_final_path=final_rel,
-            )
             shutil.copy2(source_pdf, temp_target)
 
             # 4. 임시 파일 무결성 및 PDF 파싱 검증
@@ -941,6 +964,14 @@ class Pipeline:
                     entry.input_rel, reason=f"임시 산출물 검증 실패: {ex}"
                 )
                 continue
+
+            # expected_final_sha256 와 intended_final_path 를 기록하여 크래시 복구 시 신뢰 검증 보장 (Codex finding 2 해결)
+            self.journal.record_publishing(
+                entry.input_rel,
+                temp_path=temp_target,
+                intended_final_path=final_rel,
+                expected_final_sha256=final_sha256,
+            )
 
             # 5. 덮어쓰기 없는 원자적 최종 배치
             temp_target.rename(safe_target)
@@ -977,7 +1008,6 @@ class Pipeline:
 
         undone: list[str] = []
         for entry in candidates:
-            # 복원 대상 입력 경로 (원본 철자 우선)
             target_rel = entry.actual_input_rel or entry.input_rel
             dest_input = self.input_dir / target_rel
 
@@ -1054,17 +1084,14 @@ class Pipeline:
             if entry.state in (State.PUBLISHED, State.SOURCE_CLEANUP_PENDING):
                 final_p = self.done_dir / (entry.final_path or "")
                 if final_p.exists() and compute_sha256(final_p) == entry.final_sha256:
-                    # 최종본이 이미 온전히 존재함 -> 입력 파일 정리 검증
                     if src_input and src_input.exists():
-                        # 안전 검증: 입력 파일이 변경되었는지 확인 (Codex finding 2 해결)
+                        # 안전 검증: 입력 파일이 변경되었는지 확인
                         src_hash = compute_sha256(src_input)
                         if src_hash != entry.original_sha256:
-                            # 입력 파일이 변경되었으면 새 내용을 보존하고 보류(HELD) 처리
                             reason = "복구 중단: 입력 파일 내용이 변경되어 삭제를 중단하고 보존함"
                             self.journal.record_held(entry.input_rel, reason=reason)
                             recovered.append(entry.input_rel)
                             continue
-                        # 원본 해시와 일치할 때만 안전하게 삭제
                         src_input.unlink()
 
                     self.journal.record_completed(
@@ -1072,27 +1099,28 @@ class Pipeline:
                     )
                     recovered.append(entry.input_rel)
                 else:
-                    # 최종본이 없으면 승인 상태로 돌려 재배치 가능하도록 복구
                     entry.state = State.APPROVED
                     recovered.append(entry.input_rel)
 
-            # 2. 임시 파일 생성 중 중단된 상태 (PUBLISHING) (Codex finding 5 해결)
+            # 2. 임시 파일 생성 중 중단된 상태 (PUBLISHING) (Codex finding 2 해결)
             elif entry.state == State.PUBLISHING:
                 intended_p = (
                     self.done_dir / entry.intended_final_path
                     if entry.intended_final_path
                     else None
                 )
-                # 만약 rename 직후 크래시되어 intended_p 가 이미 존재하고 유효한 경우
-                if intended_p and intended_p.exists():
-                    p_hash = compute_sha256(intended_p)
-                    # 최종본 배치 완료로 인식하여 중복 생성 방지
+                # 최종본 경로에 파일이 존재하고, 기대 해시(expected_final_sha256)와 정확히 일치할 때만 발행 완료로 인정
+                if (
+                    intended_p
+                    and intended_p.exists()
+                    and entry.expected_final_sha256
+                    and compute_sha256(intended_p) == entry.expected_final_sha256
+                ):
                     self.journal.record_published(
                         entry.input_rel,
                         final_path=entry.intended_final_path,
-                        final_sha256=p_hash,
+                        final_sha256=entry.expected_final_sha256,
                     )
-                    # 입력 파일 정리 검증 및 완료 처리
                     if src_input and src_input.exists():
                         if compute_sha256(src_input) == entry.original_sha256:
                             src_input.unlink()
@@ -1107,12 +1135,19 @@ class Pipeline:
                         entry.input_rel, approved_by_user=entry.approved_by_user or True
                     )
                     recovered.append(entry.input_rel)
+                elif intended_p and intended_p.exists():
+                    # 파일은 존재하나 기대 해시와 다름 -> 충돌로 보존하고 덮어쓰지 않음
+                    self.journal.record_held(
+                        entry.input_rel,
+                        reason=f"복구 충돌: 대상 경로({entry.intended_final_path})에 다른 내용의 파일이 존재합니다.",
+                    )
+                    recovered.append(entry.input_rel)
                 else:
-                    # 임시 파일만 있었던 경우 임시 파일은 정리되었으므로 APPROVED 로 롤백
+                    # 배치가 완료되지 않았음 -> APPROVED 로 롤백
                     entry.state = State.APPROVED
                     recovered.append(entry.input_rel)
 
-            # 3. 백업 후 중단된 상태 (BACKED_UP)
+            # 3. 백업 후 중단된 상태 (BACKED_UP) -> 재스캔 시 추출 재개 가능하도록 상태 유지
             elif entry.state == State.BACKED_UP:
                 recovered.append(entry.input_rel)
 
