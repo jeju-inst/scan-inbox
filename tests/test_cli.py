@@ -9,7 +9,8 @@ from reportlab.pdfgen import canvas
 
 from scaninbox import cli
 from scaninbox.contracts import OcrResult, OcrStatus, TitleProposal
-from scaninbox.pipeline import Pipeline, compute_sha256
+from scaninbox.journal import sha256_file
+from scaninbox.pipeline import Pipeline
 
 
 def make_pdf(path: Path, text: str = "스캔 문서 테스트") -> Path:
@@ -24,7 +25,6 @@ class FakeCliOcrEngine:
     def run(self, src: Path, dst_dir: Path, *, langs: str = "kor+eng", timeout_s: int = 600) -> OcrResult:
         out = dst_dir / f"ocr_{src.name}"
         out.write_bytes(src.read_bytes())
-        # 본문은 길고 민감할 수 있는 텍스트
         long_body = "이것은 절대 CLI 출력에 나와서는 안 되는 긴 OCR 본문 전체 텍스트입니다. " * 10
         return OcrResult(
             status=OcrStatus.OK,
@@ -37,7 +37,7 @@ class FakeCliOcrEngine:
 
 
 class FakeCliTitleExtractor:
-    def propose(self, pdf: Path, text_by_page: list[str]) -> TitleProposal:
+    def propose(self, pdf: Path, text_by_page: Sequence[str]) -> TitleProposal:
         return TitleProposal(
             title="테스트문서",
             evidence_page=1,
@@ -51,10 +51,11 @@ def cli_env(tmp_path: Path):
     in_dir = tmp_path / "in"
     done_dir = tmp_path / "out"
     backup_dir = tmp_path / "bak"
+    j_path = tmp_path / "journal.sqlite"
     in_dir.mkdir()
     done_dir.mkdir()
     backup_dir.mkdir()
-    return in_dir, done_dir, backup_dir
+    return in_dir, done_dir, backup_dir, j_path
 
 
 def test_cli_init(tmp_path, capsys):
@@ -70,13 +71,14 @@ def test_cli_init(tmp_path, capsys):
 
 
 def test_cli_scan_and_plan_text_and_json(cli_env, capsys):
-    in_dir, done_dir, backup_dir = cli_env
+    in_dir, done_dir, backup_dir, j_path = cli_env
     doc = make_pdf(in_dir / "sample_doc.pdf", "본문 텍스트")
 
     pipe = Pipeline(
-        input_dir=in_dir,
+        scan_dir=in_dir,
         done_dir=done_dir,
         backup_dir=backup_dir,
+        journal_path=j_path,
         ocr_engine=FakeCliOcrEngine(),
         title_extractor=FakeCliTitleExtractor(),
     )
@@ -95,7 +97,7 @@ def test_cli_scan_and_plan_text_and_json(cli_env, capsys):
     assert ret_plan == 0
     plan_out = capsys.readouterr().out
 
-    # 중요 검증: 제목 근거 발췌문은 나와야 하지만, OCR 본문 전체 텍스트는 절대 출력되지 않아야 함
+    # 중요: 발췌문만 허용, 본문 전체 출력 금지
     assert "제목 근거 발췌문 요약" in plan_out
     assert "절대 CLI 출력에 나와서는 안 되는 긴 OCR 본문 전체 텍스트" not in plan_out
     assert "sample_doc.pdf" in plan_out
@@ -112,15 +114,16 @@ def test_cli_scan_and_plan_text_and_json(cli_env, capsys):
 
 
 def test_cli_apply_rename_hold(cli_env, capsys):
-    in_dir, done_dir, backup_dir = cli_env
+    in_dir, done_dir, backup_dir, j_path = cli_env
     make_pdf(in_dir / "doc1.pdf", "문서 1")
     make_pdf(in_dir / "doc2.pdf", "문서 2")
     make_pdf(in_dir / "doc3.pdf", "문서 3")
 
     pipe = Pipeline(
-        input_dir=in_dir,
+        scan_dir=in_dir,
         done_dir=done_dir,
         backup_dir=backup_dir,
+        journal_path=j_path,
         ocr_engine=FakeCliOcrEngine(),
         title_extractor=FakeCliTitleExtractor(),
     )
@@ -128,7 +131,7 @@ def test_cli_apply_rename_hold(cli_env, capsys):
 
     parser = cli.build_parser()
 
-    # 1. rename: doc1 을 새 이름으로 변경 및 승인
+    # 1. rename
     args_rename = parser.parse_args([
         "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir),
         "rename", "doc1.pdf", "2026-11-05_새이름.pdf",
@@ -137,7 +140,7 @@ def test_cli_apply_rename_hold(cli_env, capsys):
     assert ret_rename == 0
     capsys.readouterr()
 
-    # 2. hold: doc2 를 보류 처리
+    # 2. hold
     args_hold = parser.parse_args([
         "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir),
         "hold", "doc2.pdf", "--reason", "추후 재검토",
@@ -146,7 +149,7 @@ def test_cli_apply_rename_hold(cli_env, capsys):
     assert ret_hold == 0
     capsys.readouterr()
 
-    # 3. apply: 승인된 doc1 만 적용
+    # 3. apply
     args_apply = parser.parse_args([
         "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir),
         "apply", "doc1.pdf",
@@ -169,7 +172,7 @@ def test_cli_apply_rename_hold(cli_env, capsys):
     assert "completed: 1건" in status_out
     assert "held: 1건" in status_out
 
-    # 5. apply --approve-all 로 남은 doc3 승인 및 적용
+    # 5. apply --approve-all
     args_all = parser.parse_args([
         "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir),
         "apply", "--approve-all",
@@ -180,13 +183,14 @@ def test_cli_apply_rename_hold(cli_env, capsys):
 
 
 def test_cli_undo_and_recover(cli_env, capsys):
-    in_dir, done_dir, backup_dir = cli_env
+    in_dir, done_dir, backup_dir, j_path = cli_env
     doc = make_pdf(in_dir / "undo_cli.pdf", "되돌리기")
 
     pipe = Pipeline(
-        input_dir=in_dir,
+        scan_dir=in_dir,
         done_dir=done_dir,
         backup_dir=backup_dir,
+        journal_path=j_path,
         ocr_engine=FakeCliOcrEngine(),
         title_extractor=FakeCliTitleExtractor(),
     )
@@ -214,13 +218,14 @@ def test_cli_undo_and_recover(cli_env, capsys):
 
 
 def test_cli_export_ledger(cli_env, tmp_path, capsys):
-    in_dir, done_dir, backup_dir = cli_env
+    in_dir, done_dir, backup_dir, j_path = cli_env
     doc = make_pdf(in_dir / "ledger_doc.pdf", "원장 시험")
 
     pipe = Pipeline(
-        input_dir=in_dir,
+        scan_dir=in_dir,
         done_dir=done_dir,
         backup_dir=backup_dir,
+        journal_path=j_path,
         ocr_engine=FakeCliOcrEngine(),
         title_extractor=FakeCliTitleExtractor(),
     )

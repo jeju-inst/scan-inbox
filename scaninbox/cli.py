@@ -20,49 +20,28 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from scaninbox.config import Config, default_backup_dir, default_done_dir
 from scaninbox.contracts import OcrStatus, State
-from scaninbox.pipeline import Pipeline, sanitize_filename
-
-
-def _resolve_paths(
-    args: argparse.Namespace,
-) -> tuple[Path, Path, Path]:
-    """CLI 인자에서 입력, 완료, 백업 디렉터리 경로 결정."""
-    input_dir = Path(args.input_dir).resolve() if args.input_dir else Path("./input").resolve()
-    if args.done_dir:
-        done_dir = Path(args.done_dir).resolve()
-    else:
-        # G1-DESIGN 기본값: 입력 폴더의 형제 scan_처리완료 또는 ./done
-        done_dir = (
-            input_dir.parent / f"{input_dir.name}_처리완료"
-            if input_dir.name != "input"
-            else Path("./done").resolve()
-        )
-    if args.backup_dir:
-        backup_dir = Path(args.backup_dir).resolve()
-    else:
-        backup_dir = (
-            input_dir.parent / f"{input_dir.name}_backup"
-            if input_dir.name != "input"
-            else Path("./backup").resolve()
-        )
-    return input_dir, done_dir, backup_dir
+from scaninbox.pipeline import Pipeline
 
 
 def _create_pipeline(args: argparse.Namespace) -> Pipeline:
-    in_dir, done_dir, backup_dir = _resolve_paths(args)
-    return Pipeline(input_dir=in_dir, done_dir=done_dir, backup_dir=backup_dir)
+    scan_dir = Path(args.input_dir).resolve() if args.input_dir else Path("./input").resolve()
+    done_dir = Path(args.done_dir).resolve() if args.done_dir else default_done_dir(scan_dir)
+    backup_dir = Path(args.backup_dir).resolve() if args.backup_dir else default_backup_dir(scan_dir)
+    cfg = Config.with_defaults(scan_dir=scan_dir, done_dir=done_dir, backup_dir=backup_dir)
+    return Pipeline(config=cfg)
 
 
 def cmd_init(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    in_dir, done_dir, backup_dir = _resolve_paths(args)
-    in_dir.mkdir(parents=True, exist_ok=True)
-    done_dir.mkdir(parents=True, exist_ok=True)
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    pipe = pipeline or _create_pipeline(args)
+    pipe.scan_dir.mkdir(parents=True, exist_ok=True)
+    pipe.done_dir.mkdir(parents=True, exist_ok=True)
+    pipe.backup_dir.mkdir(parents=True, exist_ok=True)
     print("Scan Inbox 초기화 완료:")
-    print(f"  - 입력 폴더: {in_dir}")
-    print(f"  - 완료 폴더: {done_dir}")
-    print(f"  - 백업 폴더: {backup_dir}")
+    print(f"  - 입력 폴더: {pipe.scan_dir}")
+    print(f"  - 완료 폴더: {pipe.done_dir}")
+    print(f"  - 백업 폴더: {pipe.backup_dir}")
     return 0
 
 
@@ -114,7 +93,6 @@ def cmd_plan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
         if it.title.doc_date:
             print(f"   문서 날짜 : {it.title.doc_date}")
         if it.title.evidence_snippet:
-            # 사람이 읽는 출력: 오직 짧은 발췌(evidence_snippet)만 표시, 본문 전체 금지
             print(f"   제목 근거 : p.{it.title.evidence_page or 1} \"{it.title.evidence_snippet}\"")
         if it.warnings:
             print(f"   주의 사항 : {', '.join(it.warnings)}")
@@ -142,8 +120,8 @@ def cmd_apply(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> 
 def cmd_rename(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
     pipe = pipeline or _create_pipeline(args)
     try:
-        entry = pipe.rename(args.file, args.new_name)
-        print(f"이름 지정 완료 및 승인: {entry.input_rel} -> {entry.final_name}")
+        rec = pipe.rename(args.file, args.new_name)
+        print(f"이름 지정 완료 및 승인: {rec.input_rel}")
         return 0
     except Exception as ex:
         print(f"이름 지정 실패: {ex}", file=sys.stderr)
@@ -154,8 +132,8 @@ def cmd_hold(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
     pipe = pipeline or _create_pipeline(args)
     try:
         reason = args.reason or "사용자 보류 요청"
-        entry = pipe.hold(args.file, reason=reason)
-        print(f"보류 처리 완료: {entry.input_rel} (사유: {reason})")
+        rec = pipe.hold(args.file, reason=reason)
+        print(f"보류 처리 완료: {rec.input_rel} (사유: {reason})")
         return 0
     except Exception as ex:
         print(f"보류 처리 실패: {ex}", file=sys.stderr)
@@ -177,14 +155,14 @@ def cmd_undo(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
 
 def cmd_status(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
     pipe = pipeline or _create_pipeline(args)
-    entries = pipe.journal.list_entries()
+    records = pipe.journal.list()
     print("=== Scan Inbox 상태 요약 ===")
     counts: dict[str, int] = {}
-    for e in entries:
-        st = e.state.value if isinstance(e.state, State) else str(e.state)
+    for r in records:
+        st = r.state.value if isinstance(r.state, State) else str(r.state)
         counts[st] = counts.get(st, 0) + 1
 
-    print(f"총 등록 파일: {len(entries)}건")
+    print(f"총 등록 파일: {len(records)}건")
     for st, c in sorted(counts.items()):
         print(f"  - {st}: {c}건")
     return 0
@@ -205,15 +183,11 @@ def cmd_recover(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -
 
 def cmd_export_ledger(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
     pipe = pipeline or _create_pipeline(args)
-    ledger = pipe.export_ledger()
-    ledger_json = json.dumps(ledger, ensure_ascii=False, indent=2) + "\n"
-    if args.output:
-        out_p = Path(args.output).resolve()
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        out_p.write_text(ledger_json, encoding="utf-8")
-        print(f"기록 저장 완료: {out_p}")
+    ledger = pipe.export_ledger(path=args.output)
+    if not args.output:
+        sys.stdout.write(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n")
     else:
-        sys.stdout.write(ledger_json)
+        print(f"기록 저장 완료: {args.output}")
     return 0
 
 
