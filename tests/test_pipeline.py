@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 import pytest
 from reportlab.pdfgen import canvas
 
-from scaninbox.config import Config
+from scaninbox.config import Config, ConfigError
 from scaninbox.contracts import (
     OcrEngine,
     OcrResult,
@@ -507,3 +507,87 @@ def test_pipeline_real_engine_e2e_corpus(work, tmp_path):
     res = reconcile.reconcile(manifest, ledger, in_dir, done_dir)
     assert res["errors"] == []
     assert res["ok"] is True
+
+
+def test_pipeline_default_engine_wired(tmp_path):
+    """엔진을 생략하고 생성 시 실제 OcrmypdfEngine 및 RuleTitleExtractor 가 기본 장착됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+    )
+    assert isinstance(pipe.ocr_engine, OcrmypdfEngine)
+    assert isinstance(pipe.title_extractor, RuleTitleExtractor)
+
+
+def test_pipeline_rejects_overlapping_dirs(tmp_path):
+    """디렉토리 겹침(예: backup_dir == scan_dir) 시 생성자에서 ConfigError 로 거절됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    j_path = tmp_path / "j.sqlite"
+
+    with pytest.raises(ConfigError) as exc_info:
+        Pipeline(
+            scan_dir=in_dir,
+            done_dir=done_dir,
+            backup_dir=in_dir,  # backup_dir 와 scan_dir 겹침
+            journal_path=j_path,
+        )
+    assert "겹침" in str(exc_info.value)
+
+
+def test_pipeline_backup_preserves_existing_file_at_generated_path(tmp_path):
+    """생성된 백업 후보 파일명이 이미 다른 내용으로 점유되어 있어도 기존 파일을 덮어쓰지 않고 보존함을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.OK)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    # 1. 첫 번째 세대 doc.pdf 스캔 및 백업
+    f1 = in_dir / "doc.pdf"
+    make_pdf(f1, "세대 1 내용")
+    h1 = sha256_file(f1)
+    pipe.scan()
+
+    bk1 = backup_dir / "doc.pdf"
+    assert bk1.exists()
+    assert sha256_file(bk1) == h1
+
+    # 2. 두 번째 세대 문서의 내용을 임시로 생성해 해시(h2)를 알아낸 후
+    # 백업 디렉토리에 생성될 후보 파일명(doc__<h2[:8]>.pdf)을 사전에 임의의 다른 내용으로 점유해 둠
+    temp_gen2 = tmp_path / "gen2_temp.pdf"
+    make_pdf(temp_gen2, "세대 2 내용")
+    h2 = sha256_file(temp_gen2)
+
+    colliding_backup = backup_dir / f"doc__{h2[:8]}.pdf"
+    make_pdf(colliding_backup, "이미 점유된 충돌 파일 내용")
+    colliding_hash = sha256_file(colliding_backup)
+
+    # 3. 이제 두 번째 세대 doc.pdf (temp_gen2 파일)를 in_dir 에 배치하고 스캔
+    shutil.copy2(temp_gen2, f1)
+    pipe.scan()
+
+    # 충돌 대상이었던 colliding_backup 내용이 파괴되지 않고 그대로 보존되어야 함
+    assert colliding_backup.exists()
+    assert sha256_file(colliding_backup) == colliding_hash
+
+    # 그리고 두 번째 세대 백업은 doc__<h2[:8]>_1.pdf 등 고유한 새 경로에 안전하게 생성되어야 함
+    preserved_bk2 = backup_dir / f"doc__{h2[:8]}_1.pdf"
+    assert preserved_bk2.exists()
+    assert sha256_file(preserved_bk2) == h2
+

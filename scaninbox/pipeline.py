@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from scaninbox.config import Config
+from scaninbox.config import Config, validate
 from scaninbox.contracts import (
     OcrEngine,
     OcrResult,
@@ -43,6 +46,9 @@ from scaninbox.title import RuleTitleExtractor
 log = logging.getLogger("scaninbox.pipeline")
 
 
+_UNSET = object()
+
+
 class Pipeline:
     """Scan Inbox 핵심 파이프라인."""
 
@@ -55,7 +61,7 @@ class Pipeline:
         backup_dir: Optional[Path | str] = None,
         journal_path: Optional[Path | str] = None,
         work_dir: Optional[Path | str] = None,
-        ocr_engine: Optional[OcrEngine] = None,
+        ocr_engine: Any = _UNSET,
         title_extractor: Optional[TitleExtractor] = None,
         journal: Optional[Journal] = None,
         langs: str = "kor+eng",
@@ -73,6 +79,9 @@ class Pipeline:
         else:
             raise ValueError("config 또는 scan_dir 가 필요합니다.")
 
+        # 폴더 생성 전 설정 및 경로 유효성(겹침, 심링크 등) 검증
+        validate(self.config, require_scan_exists=False)
+
         self.scan_dir = Path(self.config.scan_dir).resolve()
         self.done_dir = Path(self.config.done_dir).resolve()
         self.backup_dir = Path(self.config.backup_dir).resolve()
@@ -89,7 +98,10 @@ class Pipeline:
         self.journal = (
             journal if journal is not None else Journal(self.config.journal_path)
         )
-        self.ocr_engine = ocr_engine
+        if ocr_engine is _UNSET:
+            self.ocr_engine: Optional[OcrEngine] = OcrmypdfEngine()
+        else:
+            self.ocr_engine = ocr_engine
         self.title_extractor = title_extractor or RuleTitleExtractor()
 
     def _relative_key(self, path: Path) -> str:
@@ -156,20 +168,42 @@ class Pipeline:
                         pass
 
             # 2. 보호 (BACKED_UP 에 backup_rel 기록)
-            # 동일 파일명 이전 세대 원본 보존: 백업 파일이 이미 존재하고 해시가 다르면 고유 경로 할당
+            # 동일 파일명 이전 세대 원본 보존 및 충돌 방지:
+            # 백업 경로가 이미 존재하고 내용(해시)이 다르면 고유한 후보 경로를 찾아 기존 백업을 절대 덮어쓰지 않는다.
             backup_rel = rel
             bk_target = self.backup_dir / backup_rel
             if bk_target.exists() and sha256_file(bk_target) != sha256:
                 stem = Path(rel).stem
                 parent = Path(rel).parent
-                gen_name = f"{stem}__{sha256[:8]}.pdf"
-                backup_rel = (parent / gen_name).as_posix() if parent != Path(".") else gen_name
-                bk_target = self.backup_dir / backup_rel
+                base_gen = f"{stem}__{sha256[:8]}"
+                cand_name = f"{base_gen}.pdf"
+                cand_rel = (parent / cand_name).as_posix() if parent != Path(".") else cand_name
+                cand_target = self.backup_dir / cand_rel
+
+                counter = 1
+                while cand_target.exists() and sha256_file(cand_target) != sha256:
+                    cand_name = f"{base_gen}_{counter}.pdf"
+                    cand_rel = (parent / cand_name).as_posix() if parent != Path(".") else cand_name
+                    cand_target = self.backup_dir / cand_rel
+                    counter += 1
+
+                backup_rel = cand_rel
+                bk_target = cand_target
 
             bk_target.parent.mkdir(parents=True, exist_ok=True)
-            if not bk_target.exists() or sha256_file(bk_target) != sha256:
-                import shutil
-                shutil.copy2(path, bk_target)
+            if not bk_target.exists():
+                tmp_backup = self.work_dir / f"bk_{sha256[:12]}_{os.getpid()}_{time.time_ns()}.tmp"
+                shutil.copy2(path, tmp_backup)
+                try:
+                    move_no_overwrite(tmp_backup, bk_target)
+                except FileExistsError:
+                    if tmp_backup.exists():
+                        tmp_backup.unlink()
+                    if sha256_file(bk_target) != sha256:
+                        self.journal.transition(
+                            rec.id, State.FAILED, reason="백업 파일 대상 충돌 및 해시 불일치"
+                        )
+                        continue
 
             if sha256_file(bk_target) != sha256:
                 self.journal.transition(

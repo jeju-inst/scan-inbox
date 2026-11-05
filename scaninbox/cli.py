@@ -22,7 +22,9 @@ from typing import Optional, Sequence
 
 from scaninbox.config import Config, default_backup_dir, default_done_dir
 from scaninbox.contracts import OcrStatus, State
+from scaninbox.ocr import OcrmypdfEngine
 from scaninbox.pipeline import Pipeline
+from scaninbox.title import RuleTitleExtractor
 
 
 def _create_pipeline(args: argparse.Namespace) -> Pipeline:
@@ -30,7 +32,9 @@ def _create_pipeline(args: argparse.Namespace) -> Pipeline:
     done_dir = Path(args.done_dir).resolve() if args.done_dir else default_done_dir(scan_dir)
     backup_dir = Path(args.backup_dir).resolve() if args.backup_dir else default_backup_dir(scan_dir)
     cfg = Config.with_defaults(scan_dir=scan_dir, done_dir=done_dir, backup_dir=backup_dir)
-    return Pipeline(config=cfg)
+    engine = OcrmypdfEngine()
+    title_ext = RuleTitleExtractor()
+    return Pipeline(config=cfg, ocr_engine=engine, title_extractor=title_ext)
 
 
 def cmd_init(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
