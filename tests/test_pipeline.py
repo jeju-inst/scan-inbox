@@ -618,6 +618,7 @@ def test_pipeline_recover_publishing_reconciles_published_file(env_dirs):
     entry = pipe.journal.get_entry("crash_publishing.pdf")
     entry.state = State.PUBLISHING
     entry.intended_final_path = intended_name
+    entry.expected_final_sha256 = orig_sha256
 
     rec = pipe.recover()
     assert "crash_publishing.pdf" in rec
@@ -625,4 +626,117 @@ def test_pipeline_recover_publishing_reconciles_published_file(env_dirs):
     assert intended_p.exists()
     assert len(list(done_dir.glob("*.pdf"))) == 1  # 접미사 붙은 중복 파일 없음!
     assert entry.state == State.COMPLETED
+
+
+def test_pipeline_no_ocr_engine_fails_closed(env_dirs):
+    """P1: OCR 엔진이 설정되지 않은 경우 성공을 위장하지 않고 거부 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "no_engine.pdf", "엔진 없는 문서")
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=None,  # 엔진 미설정
+        title_extractor=FakeTitleExtractor(),
+    )
+    items = pipe.scan()
+    # 엔진이 없으므로 plan_items 는 비어있어야 하고 FAILED 처리되어야 함
+    assert len(items) == 0
+    entry = pipe.journal.get_entry("no_engine.pdf")
+    assert entry is not None
+    assert entry.state == State.FAILED
+    assert "OCR 엔진 미설정" in entry.reason
+    assert doc.exists()  # 입력 파일 보존
+
+
+def test_pipeline_recover_publishing_rejects_mismatched_output_hash(env_dirs):
+    """P1: PUBLISHING 복구 시 목적지 파일의 해시가 기대값과 다르면 충돌 HELD 보존 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "mismatch_output.pdf", "원본 내용")
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe.scan()
+
+    intended_name = "2026-11-05_목적지문서.pdf"
+    # 다른 내용의 파일이 이미 목적지에 존재함
+    tampered_p = done_dir / intended_name
+    make_pdf(tampered_p, "다른 프로세스가 생성한 무관한 파일")
+
+    entry = pipe.journal.get_entry("mismatch_output.pdf")
+    entry.state = State.PUBLISHING
+    entry.intended_final_path = intended_name
+    entry.expected_final_sha256 = "0123456789abcdef" * 4  # 기대 해시와 전혀 다름
+
+    rec = pipe.recover()
+    assert "mismatch_output.pdf" in rec
+    # 타 파일을 덮어쓰거나 원본을 지우지 않고 HELD 보존
+    assert doc.exists()
+    assert entry.state == State.HELD
+    assert "충돌" in entry.reason
+
+
+def test_pipeline_resume_extraction_from_backed_up(env_dirs):
+    """P2: BACKED_UP 상태에서 중단된 경우 재스캔 시 추출을 재개하여 REVIEW_PENDING 으로 승격 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "interrupted_backup.pdf", "중단 문서")
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe.scan()
+
+    # 강제로 BACKED_UP 상태로 되돌려 추출 미완료 상황 모의
+    entry = pipe.journal.get_entry("interrupted_backup.pdf")
+    entry.state = State.BACKED_UP
+
+    # 재스캔 실행
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "interrupted_backup.pdf"
+    assert entry.state == State.REVIEW_PENDING  # 추출 재개 완료
+
+
+def test_pipeline_new_document_under_completed_name(env_dirs):
+    """P2: 이미 완료된 파일명으로 새로운 내용의 문서가 투입되었을 때 정상 발견 및 처리 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "scan.pdf", "1세대 문서")
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe.scan()
+    pipe.apply(approve_all=True)
+
+    # 1세대 완료 확인
+    assert not doc.exists()
+    assert pipe.journal.get_entry("scan.pdf").state == State.COMPLETED
+
+    # 스캐너가 동일한 scan.pdf 라는 이름으로 2세대 새 문서를 작성
+    make_pdf(doc, "2세대 완전히 새로운 문서 내용")
+
+    # 재스캔 실행 시 스킵되지 않고 새 문서로 등록되어야 함
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "scan.pdf"
+    assert items[0].original_sha256 == compute_sha256(doc)
+
+    # 2세대 문서도 정상 적용 완료
+    pipe.apply(approve_all=True)
+    assert not doc.exists()
+
 
