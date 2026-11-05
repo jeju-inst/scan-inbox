@@ -105,9 +105,8 @@ class Pipeline:
         self.title_extractor = title_extractor or RuleTitleExtractor()
 
     def _relative_key(self, path: Path) -> str:
-        """scan_dir 기준 NFC 정규화 상대경로."""
-        rel = path.relative_to(self.scan_dir).as_posix()
-        return nfc(rel)
+        """scan_dir 기준 상대경로 (파일시스템 실제 철자 보존)."""
+        return path.relative_to(self.scan_dir).as_posix()
 
     def scan(self) -> list[PlanItem]:
         """발견→등록→보호→추출→제안 단계 수행 (입력 무변경 보장)."""
@@ -140,6 +139,13 @@ class Pipeline:
             # 이미 종결된 상태면 건너뜀
             if rec.state in (State.COMPLETED, State.HELD, State.FAILED):
                 continue
+
+            # 이전 스캔 중 EXTRACTED 전이 후 REVIEW_PENDING 전에 중단된 경우,
+            # 허용 전이(EXTRACTED -> DISCOVERED)로 리셋하여 안전하게 보호 및 재추출을 수행한다.
+            if rec.state == State.EXTRACTED:
+                rec = self.journal.transition(
+                    rec.id, State.DISCOVERED, reason="미완료 EXTRACTED 상태 재설정"
+                )
 
             # 이미 추출/제안이 완료되어 승인 대기 중인 레코드 재사용
             if rec.state in (State.REVIEW_PENDING, State.APPROVED):
@@ -333,9 +339,12 @@ class Pipeline:
         return items
 
     def _find_latest_record(self, input_rel: str) -> FileRecord:
-        """input_rel 에 해당하는 가장 최근 저널 레코드 검색."""
+        """input_rel 에 해당하는 가장 최근 저널 레코드 검색 (원래 철자 및 정규화 키 동시 비교)."""
         norm_key = nfc(input_rel)
-        matches = [r for r in self.journal.list() if r.input_rel == norm_key]
+        matches = [
+            r for r in self.journal.list()
+            if r.input_rel == input_rel or nfc(r.input_rel) == norm_key
+        ]
         if not matches:
             raise KeyError(f"저널에 존재하지 않는 파일입니다: {input_rel}")
         return matches[-1]
@@ -406,13 +415,25 @@ class Pipeline:
                 self.journal.transition(rec.id, State.FAILED, reason=reason)
                 raise ValueError(f"{rec.input_rel}: {reason}")
 
-            # 2. 승인 상태 확인 (REVIEW_PENDING 에서 온 경우 승인 처리)
+            # 2. 보관된 백업 파일의 무결성 재검증 (변조/손상 시 입력 삭제 및 오염본 발행 방지)
+            if rec.backup_rel:
+                bk_path = self.backup_dir / rec.backup_rel
+                if not bk_path.exists():
+                    reason = f"백업 파일 소실: {rec.backup_rel}"
+                    self.journal.transition(rec.id, State.FAILED, reason=reason)
+                    raise FileNotFoundError(reason)
+                if sha256_file(bk_path) != rec.original_sha256:
+                    reason = f"백업 파일 변조 감지: 등록된 원본 해시와 불일치 ({rec.backup_rel})"
+                    self.journal.transition(rec.id, State.FAILED, reason=reason)
+                    raise ValueError(reason)
+
+            # 3. 승인 상태 확인 (REVIEW_PENDING 에서 온 경우 승인 처리)
             if rec.state != State.APPROVED:
                 rec = self.journal.transition(
                     rec.id, State.APPROVED, approved_by_user=True
                 )
 
-            # 3. 소스 PDF 결정 (OCR 필수 정책 준수)
+            # 4. 소스 PDF 결정 (OCR 필수 정책 준수)
             plan_data: dict[str, Any] = {}
             if rec.plan_json:
                 try:

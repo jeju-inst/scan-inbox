@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -590,4 +591,107 @@ def test_pipeline_backup_preserves_existing_file_at_generated_path(tmp_path):
     preserved_bk2 = backup_dir / f"doc__{h2[:8]}_1.pdf"
     assert preserved_bk2.exists()
     assert sha256_file(preserved_bk2) == h2
+
+
+def test_pipeline_apply_rejects_modified_backup(tmp_path):
+    """scan 과 apply 사이에 백업 파일이 변조되면 apply 에서 거절되고 원본 입력이 보존됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    f1 = in_dir / "already.pdf"
+    make_pdf(f1, "원본 PDF 내용")
+    pipe.scan()
+    pipe.approve("already.pdf")
+
+    # 백업 파일을 의도적으로 변조
+    bk_file = backup_dir / "already.pdf"
+    assert bk_file.exists()
+    bk_file.write_bytes(b"%PDF-1.4 modified corrupted content")
+
+    # apply 시 백업 변조가 감지되어 ValueError 발생해야 함
+    with pytest.raises(ValueError, match="백업 파일 변조 감지"):
+        pipe.apply(approve_all=False)
+
+    # 원본 입력 파일은 절대 삭제되지 않고 온전히 남아 있어야 함
+    assert f1.exists()
+
+
+def test_pipeline_resumes_from_persisted_extracted_state(tmp_path):
+    """EXTRACTED 전이 후 중단되어 다음 scan 에서 EXTRACTED 상태로 재시작될 때 IllegalTransition 없이 복구됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.OK)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    f1 = in_dir / "doc.pdf"
+    make_pdf(f1, "문서 내용")
+    pipe.scan()
+
+    # 강제로 EXTRACTED 상태로 되돌려 비정상 중단 상황을 모사
+    rec = pipe._find_latest_record("doc.pdf")
+    assert rec is not None
+    # REVIEW_PENDING -> DISCOVERED -> BACKED_UP -> EXTRACTED
+    rec = pipe.journal.transition(rec.id, State.DISCOVERED, reason="강제 롤백")
+    rec = pipe.journal.transition(rec.id, State.BACKED_UP, backup_rel="doc.pdf")
+    rec = pipe.journal.transition(rec.id, State.EXTRACTED)
+    assert rec.state == State.EXTRACTED
+
+    # 다음 scan() 실행 시 IllegalTransition 없이 정상 스캔 및 제안 완료
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "doc.pdf"
+
+
+def test_pipeline_preserves_filesystem_nfd_path(tmp_path):
+    """NFD 자모 분리 파일명 환경에서 파일시스템 실제 철자를 보존하여 FileNotFoundError 없이 처리됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    # NFD 파일명 생성
+    nfd_filename = unicodedata.normalize("NFD", "스캔테스트_한글.pdf")
+    f1 = in_dir / nfd_filename
+    make_pdf(f1, "NFD 문서 내용")
+
+    items = pipe.scan()
+    assert len(items) == 1
+    # input_rel 이 파일시스템의 실제 NFD 철자를 그대로 보존해야 함
+    assert items[0].input_rel == nfd_filename
+
+    # 승인 및 apply 가 FileNotFoundError 없이 완료되어야 함
+    pipe.approve(nfd_filename)
+    applied = pipe.apply(approve_all=False)
+    assert applied == [nfd_filename]
+    assert not f1.exists()
+
 
