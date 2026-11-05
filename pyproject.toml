@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "scaninbox-corpus"
+name = "scaninbox"
 version = "0.1.0"
-description = "Scan Inbox 합성 코퍼스 생성기와 인수 검증 하네스 (완전 가상 문서만 생성)"
+description = "Scan Inbox: 스캔 PDF 이름·OCR 정리 CLI와 합성 코퍼스 검증 하네스"
 readme = "scaninbox_corpus/README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -15,6 +15,7 @@ dependencies = [
   "reportlab==5.1.0",
   "pypdf==6.21.4",
 ]
+# G1 구현 의존성(ocrmypdf 등)은 해당 트랙 PR 에서 검증한 버전으로 추가한다.
 
 [project.optional-dependencies]
 dev = [
@@ -28,7 +29,7 @@ scaninbox-reconcile = "scaninbox_corpus.reconcile:main"
 scaninbox-snapshot = "scaninbox_corpus.snapshot:main"
 
 [tool.setuptools]
-packages = ["scaninbox_corpus"]
+packages = ["scaninbox", "scaninbox_corpus"]
 
 [tool.setuptools.package-data]
 scaninbox_corpus = ["schema/*.json"]
