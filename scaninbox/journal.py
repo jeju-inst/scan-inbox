@@ -6,6 +6,16 @@
   중간에 죽으면 `recover()` 가 실제 파일·해시와 대조해 다음 상태를 정한다. recover 는 입력·완료함 파일을
   삭제하지 않는다(정리는 파이프라인 몫). 여러 번 불러도 같은 결과(멱등)다.
 - OCR 본문은 저장하지 않는다.
+
+pipeline 이 지켜야 할 규약 (총괄 승인 2026-11-05):
+1. Undo: 원본을 입력에 되돌린 뒤 `COMPLETED → DISCOVERED` 로만 재등록한다(UNDONE 상태는 없다).
+2. 사용자 승인: `approved_by_user` 가 참이 아니면 `COMPLETED` 전이는 거절된다. 승인은 `APPROVED` 전이에
+   `approved_by_user=True` 로 명시해야 한다.
+3. recover 는 입력 파일을 지우지 않는다. 정리 대기 중 입력이 같은 내용으로 남아 있으면 `needs_source_cleanup`
+   으로 알리기만 하므로, 입력 삭제 후 `COMPLETED` 로 올리는 것은 pipeline 의 일이다.
+4. 기록 순서: `BACKED_UP` 전이에 `backup_rel`(backup_dir 기준 상대경로)을 기록한다. 최종본을 임시로 만들어
+   검증해 해시를 안 뒤 `PUBLISHING` 전이에 `final_rel`(done_dir 기준)·`final_sha256` 을 함께 기록하고,
+   그 다음에 파일을 배치(`pathsafe.move_no_overwrite`)한 뒤 `PUBLISHED` 로 기록한다.
 """
 from __future__ import annotations
 
