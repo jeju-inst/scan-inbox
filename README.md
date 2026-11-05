@@ -8,6 +8,7 @@ Windows·macOS에서 스캔 폴더를 **미처리 문서함**으로 유지하기
 - [기존 OSS 비교와 채택 게이트](docs/OSS-EVALUATION.md)
 - [파일럿 및 인수 기준](docs/PILOT.md)
 - [다음 작업 세션 인수인계](SESSION_HANDOFF.md)
+- [합성 코퍼스 생성기·인수 검증 하네스](scaninbox_corpus/README.md)
 
 ## 원하는 경험
 

@@ -1,0 +1,23 @@
+# G0 시험 2단계: OCR 사본에서 제목을 정규식으로 뽑아 done/ 으로 이름 바꿔 이동. 제목을 못 뽑으면 review/ 로 보낸다.
+# 이 합성 코퍼스의 고정 서식(기관 줄 -> 날짜/번호 줄 -> 제목)을 가정한 규칙이다. 서식이 다르면 규칙을 새로 써야 한다.
+rules:
+  - name: titled
+    locations:
+      - path: "{env.G0RUN}/work"
+    filters:
+      - extension: pdf
+      - filecontent: '(?:가상과|Office)\s*\n(?:[^\n]*\d{4}[^\n]*\n)?\s*(?P<title>[^\n:]{4,40})\n'
+    actions:
+      - move:
+          dest: "{env.G0RUN}/done/{filecontent.title}.pdf"
+          on_conflict: rename_new
+          rename_template: "{name} {counter}{extension}"
+  - name: untitled-to-review
+    locations:
+      - path: "{env.G0RUN}/work"
+    filters:
+      - extension: pdf
+    actions:
+      - move:
+          dest: "{env.G0RUN}/review/"
+          on_conflict: rename_new

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "처리 결과 기록(ledger): reconcile 입력",
+  "type": "object",
+  "required": ["entries"],
+  "properties": {
+    "entries": {
+      "type": "array",
+      "description": "ledger 에 없는 입력은 '미착수'로 센다.",
+      "items": {
+        "type": "object",
+        "required": ["input", "status"],
+        "properties": {
+          "input": { "type": "string", "description": "입력 폴더 기준 상대경로" },
+          "status": { "enum": ["completed", "held", "failed"] },
+          "original_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "final_path": { "type": "string", "description": "completed 일 때 완료 폴더 기준 상대경로" },
+          "final_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "reason": { "type": "string", "description": "held·failed 일 때 필수" }
+        }
+      }
+    }
+  }
+}
