@@ -40,9 +40,10 @@ TRANSITIONS: dict[State, frozenset[State]] = {
     S.DISCOVERED: frozenset({S.WAITING_STABLE, S.BACKED_UP, S.HELD, S.FAILED}),
     S.WAITING_STABLE: frozenset({S.DISCOVERED, S.BACKED_UP, S.HELD, S.FAILED}),
     S.BACKED_UP: frozenset({S.DISCOVERED, S.EXTRACTED, S.HELD, S.FAILED}),
-    S.EXTRACTED: frozenset({S.REVIEW_PENDING, S.HELD, S.FAILED}),
-    S.REVIEW_PENDING: frozenset({S.APPROVED, S.HELD, S.FAILED}),
-    S.APPROVED: frozenset({S.PUBLISHING, S.REVIEW_PENDING, S.HELD, S.FAILED}),
+    # 백업 훼손 시 recover 가 DISCOVERED 로 되돌려 다시 보호한다
+    S.EXTRACTED: frozenset({S.DISCOVERED, S.REVIEW_PENDING, S.HELD, S.FAILED}),
+    S.REVIEW_PENDING: frozenset({S.DISCOVERED, S.APPROVED, S.HELD, S.FAILED}),
+    S.APPROVED: frozenset({S.DISCOVERED, S.PUBLISHING, S.REVIEW_PENDING, S.HELD, S.FAILED}),
     S.PUBLISHING: frozenset({S.PUBLISHED, S.APPROVED, S.FAILED}),
     S.PUBLISHED: frozenset({S.SOURCE_CLEANUP_PENDING, S.FAILED}),
     S.SOURCE_CLEANUP_PENDING: frozenset({S.COMPLETED, S.HELD, S.FAILED}),
@@ -433,11 +434,13 @@ class Journal:
                                                   "completed 인데 최종본이 없거나 달라짐"))
 
         for rec in self.list():
-            process(rec)
-            # 같은 호출에서 PUBLISHED 까지 간 건 바로 다음 단계(정리 대기)까지 이어서 확인한다
-            cur = self.get(rec.id)
-            if cur.state is S.PUBLISHED and cur.state is not rec.state:
-                process(cur)
+            # PUBLISHING → PUBLISHED → SOURCE_CLEANUP_PENDING 는 같은 호출에서 이어서 검증한다(멱등 보장)
+            for _ in range(3):
+                before = rec.state
+                process(rec)
+                rec = self.get(rec.id)
+                if rec.state is before or rec.state not in (S.PUBLISHED, S.SOURCE_CLEANUP_PENDING):
+                    break
         return actions
 
     # ------------------------------------------------------------ ledger

@@ -275,7 +275,8 @@ def test_recover_publishing_with_verified_final_goes_published(env):
     rec = env.to_publishing(env.to_approved(env.add()), write=True)
     acts = recover(env)
     assert [(a.action, a.to_state) for a in acts] == [
-        ("published_verified", S.PUBLISHED), ("to_source_cleanup", S.SOURCE_CLEANUP_PENDING)]
+        ("published_verified", S.PUBLISHED), ("to_source_cleanup", S.SOURCE_CLEANUP_PENDING),
+        ("needs_source_cleanup", S.SOURCE_CLEANUP_PENDING)]
     assert env.j.get(rec.id).state is S.SOURCE_CLEANUP_PENDING
 
 
@@ -387,7 +388,7 @@ def test_recover_is_idempotent(env):
     env.to_publishing(env.to_approved(env.add("a.pdf", b"a")), write=True)
     env.to_publishing(env.to_approved(env.add("b.pdf", b"b")), write=False)
     first = recover(env)
-    assert len(first) == 3
+    assert len(first) == 4
     second = recover(env)
     # 두 번째는 상태를 바꾸지 않는다(정보성 알림 needs_source_cleanup 만 반복)
     assert all(a.from_state == a.to_state and a.action == "needs_source_cleanup" for a in second)
@@ -476,3 +477,30 @@ def test_ledger_completed_entry_has_fields_reconcile_reads(tmp_path):
     ent = led["entries"][0]
     assert set(ent) >= {"input", "status", "original_sha256", "final_path", "final_sha256", "approved_by_user"}
     e.j.close()
+
+
+def test_recover_reprotects_from_every_early_state(env):
+    """EXTRACTED·REVIEW_PENDING·APPROVED 에서 백업이 사라져도 recover 가 예외 없이 DISCOVERED 로 되돌린다."""
+    recs = []
+    for i, upto in enumerate(("extracted", "review_pending", "approved")):
+        r = env.protect(env.add(f"{upto}.pdf", f"d{i}".encode()))
+        r = env.j.transition(r.id, S.EXTRACTED)
+        if upto != "extracted":
+            r = env.j.transition(r.id, S.REVIEW_PENDING)
+        if upto == "approved":
+            r = env.j.transition(r.id, S.APPROVED, approved_by_user=True)
+        (env.bak / r.original_sha256).unlink()
+        recs.append(r)
+    acts = recover(env)
+    assert [a.action for a in acts] == ["reprotect"] * 3
+    assert all(env.j.get(r.id).state is S.DISCOVERED for r in recs)
+
+
+def test_recover_verifies_cleanup_pending_in_same_call(env):
+    """PUBLISHING 에서 시작해도 백업이 없으면 첫 호출에서 HELD 까지 간다(두 번째 호출이 필요 없다)."""
+    rec = env.to_publishing(env.to_approved(env.add()), write=True)
+    (env.bak / rec.original_sha256).unlink()
+    acts = recover(env)
+    assert [a.action for a in acts] == ["published_verified", "to_source_cleanup", "held_unverified"]
+    assert env.j.get(rec.id).state is S.HELD
+    assert recover(env) == []
