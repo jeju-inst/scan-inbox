@@ -12,7 +12,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 - 의존성은 `pyproject.toml` 에 정확한 버전으로 고정합니다(Pillow, reportlab, pypdf; 시험용 pytest, jsonschema). 검증 환경: Python 3.14, macOS arm64.
 - 같은 `--seed`·폰트·라이브러리 버전이면 바이트 단위로 같은 파일이 나옵니다(결정적). 기본 seed 20261105.
-- **폰트**: 나눔바른고딕(NanumBarunGothic.ttf, Naver, SIL Open Font License 1.1)을 시스템에서 찾아 씁니다. 폰트 파일은 저장소에 넣지 않으며 manifest 에는 파일명·SHA-256·라이선스만 기록합니다(경로 미기록). 다른 TTF 는 `--font` 또는 `SCANINBOX_FONT` 로 지정합니다(reportlab 이 CFF 기반 OTF 를 임베드하지 못해 TrueType 만 지원). 이 폰트의 OFL 은 배포처의 공식 고지에 근거한 기록이며, 시스템 설치본 파일 안에서 라이선스 문자열을 직접 확인하지는 못했습니다.
+- **폰트**: 나눔바른고딕(NanumBarunGothic.ttf, Naver, SIL Open Font License 1.1) → 나눔고딕 → Noto Sans KR 순으로 macOS·Linux·Windows(`%WINDIR%\Fonts`, 사용자 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`) 폴더에서 찾고, OFL 폰트가 없으면 마지막 수단으로 맑은 고딕(`malgun.ttf`, 비OFL)을 경고와 함께 씁니다. 이때 manifest 의 라이선스 필드는 OFL 이 아니라 `NOT-OFL: …` 로 기록되며 그 생성물은 공개 저장소에 올리면 안 됩니다(`--font`·`SCANINBOX_FONT` 로 지정한 임의 폰트도 같음). 폰트 파일은 저장소에 넣지 않으며 manifest 에는 파일명·SHA-256·라이선스만 기록합니다(경로 미기록). 다른 TTF 는 `--font` 또는 `SCANINBOX_FONT` 로 지정합니다(reportlab 이 CFF 기반 OTF 를 임베드하지 못해 TrueType 만 지원). 이 폰트의 OFL 은 배포처의 공식 고지에 근거한 기록이며, 시스템 설치본 파일 안에서 라이선스 문자열을 직접 확인하지는 못했습니다.
 - 스캔 느낌은 150dpi 래스터화 + 기울기(±0.6도) + 종이 노이즈 + 약한 흐림 + 먼지 점 + JPEG(품질 72)입니다. 실제 스캐너 품질을 대표하지 않습니다.
 
 ## 생성되는 것
@@ -57,6 +57,16 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 
 삭제·추가·이름 변경(NFC/NFD 변경 구분)·내용 수정·mtime 변경·폴더 증감을 보고하고 변경이 있으면 종료 코드 1입니다. 심볼릭 링크는 따라가지 않고 대상 문자열만 비교합니다.
+
+## Windows 에서
+
+- 임시 폴더 접두와 합친 "긴 한글 경로"(228자)가 `MAX_PATH`(260자)를 넘어 일반 경로로는 `mkdir`·`copytree` 가 실패할 수 있습니다. 생성기·`snapshot`·`reconcile` 은 루트 경로를 `\\?\` 확장 경로로 바꿔 쓰고(Windows 에서만), 시험도 같은 방식으로 임시 루트를 만듭니다. 이 처리는 macOS 에서 문자열 변환만 시험했으며 **Windows 실기 재검증이 필요합니다.**
+- `snapshot` 은 링크 대상 문자열의 `\\?\` 접두를 떼고 기록·비교합니다.
+
+## reconcile 이 잡는 기대 결과 위반
+
+- 기대 결과 `fail`(암호화·손상 PDF)이 `completed` 로 기록되면 `[실패 위장]`(최종본 기록이 부족해도 잡음).
+- 기대 결과 `review`(제목 없는 서식, 다중 문서 묶음)가 ledger 의 `approved_by_user: true` 없이 `completed` 로 기록되면 `[검토 누락]`. 사용자가 검토·승인한 뒤 완료하는 흐름은 `approved_by_user: true` 를 남겨 통과시킵니다.
 
 ## 한계
 

@@ -17,6 +17,8 @@ import sys
 import unicodedata
 from pathlib import Path
 
+from .pathutil import extended, strip_extended_str
+
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -26,13 +28,18 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def link_target(p: Path) -> str:
+    """링크 대상 문자열. Python 의 Windows readlink 는 `\\\\?\\` 접두를 붙일 수 있어 떼고 비교한다."""
+    return strip_extended_str(os.readlink(p))
+
+
 def nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
 
 def take(root: Path) -> dict:
     """root 아래 모든 파일·폴더·심볼릭 링크를 기록한다(링크는 따라가지 않음)."""
-    root = Path(root)
+    root = extended(root)
     files: dict[str, dict] = {}
     dirs: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -41,14 +48,14 @@ def take(root: Path) -> dict:
             p = dp / d
             rel = p.relative_to(root).as_posix()
             if p.is_symlink():  # 폴더를 가리키는 링크: 따라가지 않고 대상 문자열만 기록
-                files[rel] = {"symlink": os.readlink(p), "dir_link": True}
+                files[rel] = {"symlink": link_target(p), "dir_link": True}
             else:
                 dirs.append(rel)
         for fn in sorted(filenames):
             p = dp / fn
             rel = p.relative_to(root).as_posix()
             if p.is_symlink():
-                files[rel] = {"symlink": os.readlink(p)}
+                files[rel] = {"symlink": link_target(p)}
                 continue
             st = p.stat()
             files[rel] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": _sha256(p)}
