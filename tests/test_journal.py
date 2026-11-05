@@ -504,3 +504,30 @@ def test_recover_verifies_cleanup_pending_in_same_call(env):
     assert [a.action for a in acts] == ["published_verified", "to_source_cleanup", "held_unverified"]
     assert env.j.get(rec.id).state is S.HELD
     assert recover(env) == []
+
+
+def test_recover_persists_renamed_final_path_before_cleanup(env):
+    rec = env.add()
+    rec = env.to_publishing(env.to_approved(rec), write=True)
+    env.j.transition(rec.id, S.PUBLISHED)
+    env.j.transition(rec.id, S.SOURCE_CLEANUP_PENDING)
+    old = env.done / env.j.get(rec.id).final_rel
+    new = env.done / (old.stem + "_2.pdf")
+    old.rename(new)                                   # 정리 대기 중 최종본 이름이 바뀜
+    a = recover(env)[0]
+    assert a.action == "needs_source_cleanup" and new.name in a.detail
+    assert env.j.get(rec.id).final_rel == new.name
+    (env.inp / rec.input_rel).unlink()
+    env.j.transition(rec.id, S.COMPLETED)
+    assert env.j.export_ledger()["entries"][0]["final_path"] == new.name
+
+
+def test_ledger_follows_latest_attempt_after_undo_of_older_record(env):
+    a = env.add("x.pdf", b"one")
+    env.j.transition(a.id, S.FAILED, reason="1차")
+    b = env.j.register("x.pdf", sha(b"two"))
+    env.j.transition(b.id, S.HELD, reason="2차")
+    env.j.transition(a.id, S.DISCOVERED)              # 옛 기록을 되살려 재시도(id 는 더 작다)
+    env.j.transition(a.id, S.HELD, reason="3차")
+    e = env.j.export_ledger()["entries"]
+    assert len(e) == 1 and e[0]["original_sha256"] == sha(b"one") and e[0]["reason"] == "3차"

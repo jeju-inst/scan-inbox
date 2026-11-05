@@ -204,3 +204,28 @@ def test_move_no_overwrite_cross_device_fallback(tmp_path, monkeypatch):
     ps.move_no_overwrite(src, d / "f.pdf")
     assert (d / "f.pdf").read_bytes() == b"data" and not src.exists()
     assert [n for n in os.listdir(d)] == ["f.pdf"]  # 임시 파일이 남지 않음
+
+
+def test_cross_device_temp_name_is_short(tmp_path, monkeypatch):
+    import errno
+    src = tmp_path / "s.bin"; src.write_bytes(b"d")
+    d = tmp_path / "d"; d.mkdir()
+    seen = []
+    real_open = open
+
+    def spy(path, mode="r", *a, **k):
+        if "x" in mode:
+            seen.append(os.path.basename(path))
+        return real_open(path, mode, *a, **k)
+    real = ps._atomic_place
+    n = {"c": 0}
+
+    def flaky(a, b):
+        n["c"] += 1
+        if n["c"] == 1:
+            raise OSError(errno.EXDEV, "x")
+        return real(a, b)
+    monkeypatch.setattr(ps, "_atomic_place", flaky)
+    monkeypatch.setattr("builtins.open", spy)
+    ps.move_no_overwrite(src, d / ("가" * 70 + ".pdf"))
+    assert seen and len(seen[0]) <= 16

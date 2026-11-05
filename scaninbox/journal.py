@@ -316,6 +316,23 @@ class Journal:
 
     # ------------------------------------------------------------ 조회
 
+    def update_fields(self, file_id: int, *, note: str = "", **fields) -> FileRecord:
+        """상태는 그대로 두고 필드만 갱신(이벤트 기록). 복구가 확인한 최종 경로 보정 등에 쓴다."""
+        bad = set(fields) - _FIELDS
+        if bad or not fields:
+            raise JournalError(f"갱신할 수 없는 필드: {sorted(bad) or '없음'}")
+        now = self._clock()
+        with self._tx() as db:
+            row = db.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
+            if row is None:
+                raise JournalError(f"없는 file_id: {file_id}")
+            sets = {"updated_at": now, **{k: (int(v) if k == "approved_by_user" else v) for k, v in fields.items()}}
+            db.execute(f"UPDATE files SET {', '.join(f'{k}=?' for k in sets)} WHERE id=?", (*sets.values(), file_id))
+            db.execute("INSERT INTO events(file_id, at, from_state, to_state, note) VALUES (?,?,?,?,?)",
+                       (file_id, now, row["state"], row["state"], note))
+            r = db.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        return _row(r)
+
     def get(self, file_id: int) -> FileRecord:
         r = self._db.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
         if r is None:
@@ -415,8 +432,10 @@ class Journal:
                 elif inp == "missing":
                     act(rec, S.COMPLETED, "completed_verified", found, final_rel=found)
                 else:
+                    if found != rec.final_rel:   # 이름이 바뀐 최종본을 채택했다면 ledger 용으로 기록해 둔다
+                        self.update_fields(rec.id, note="recover:final_renamed", final_rel=found)
                     actions.append(RecoveryAction(rec.id, rec.input_rel, st, st, "needs_source_cleanup",
-                                                  "입력이 아직 있음: 파이프라인이 정리 후 completed"))
+                                                  f"입력이 아직 있음: 파이프라인이 정리 후 completed (final_rel={found})"))
             elif st in (S.BACKED_UP, S.EXTRACTED, S.REVIEW_PENDING, S.APPROVED):
                 inp = input_state(rec)
                 if inp == "changed":
@@ -452,8 +471,11 @@ class Journal:
         reconcile 이 '미착수'로 센다. 같은 입력에 기록이 여러 개면(재시도·Undo) 가장 최근 기록 하나만 낸다.
         """
         latest: dict[str, FileRecord] = {}
-        for rec in self.list():
-            latest[rec.input_rel] = rec  # id 오름차순이므로 마지막이 최신
+        # 처리 시도의 최신성은 마지막 이벤트 순서로 본다(재시도·Undo 는 기존 기록을 되살리므로 id 순서와 다를 수 있다)
+        order = self._db.execute(
+            "SELECT f.* FROM files f ORDER BY (SELECT MAX(id) FROM events WHERE file_id=f.id), f.id").fetchall()
+        for rec in map(_row, order):
+            latest[rec.input_rel] = rec
         entries = []
         for rel, rec in latest.items():
             if rec.state not in TERMINAL_FOR_LEDGER:

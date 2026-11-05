@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import unicodedata
+import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, Optional
 
@@ -261,7 +262,8 @@ def move_no_overwrite(src: Path | str, dst: Path | str) -> None:
         import errno
         if e.errno != errno.EXDEV:
             raise
-    tmp = dst.with_name(f".{dst.name}.{os.getpid()}.partial")
+    # 임시 이름은 짧게 둔다: 최종 이름이 경로 예산 끝까지 찬 경우에도 임시 경로가 최종 경로보다 길어지지 않게
+    tmp = dst.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
     try:
         with open(src, "rb") as fi, open(tmp, "xb") as fo:
             shutil.copyfileobj(fi, fo, 1 << 20)
