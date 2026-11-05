@@ -433,13 +433,19 @@ class JsonFileJournal(InMemoryJournal):
                     doc_type=item.get("doc_type"),
                     updated_at=item.get("updated_at", time.time()),
                 )
-                self.entries[self._normalize_key(entry.input_rel)] = entry
+                storage_key = item.get("storage_key") or self._normalize_key(entry.input_rel)
+                self.entries[storage_key] = entry
         except Exception:
             pass
 
     def _save(self) -> None:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"entries": [e.to_dict() for e in self.list_entries()]}
+        data = {
+            "entries": [
+                {"storage_key": k, **e.to_dict()}
+                for k, e in self.entries.items()
+            ]
+        }
         tmp = self.file_path.parent / f".tmp_{self.file_path.name}"
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.file_path)
@@ -653,10 +659,8 @@ class Pipeline:
             # 이미 완료된 파일명으로 새 문서가 도착한 경우 (Codex finding 4 해결)
             if existing_entry and existing_entry.state == State.COMPLETED:
                 if existing_entry.original_sha256 == sha256:
-                    # 동일 내용의 기완료 파일이면 스킵
                     continue
                 else:
-                    # 다른 내용의 새 문서 도착: 기존 완료 항목을 아카이브하고 새 등록 진행
                     self.journal.archive_completed_entry(rel_key)
                     existing_entry = None
 
@@ -664,7 +668,7 @@ class Pipeline:
             if existing_entry and existing_entry.state in (State.HELD, State.FAILED):
                 continue
 
-            # 재스캔 시 이미 등록되어 검토/승인 대기 중인 항목 처리 (Codex finding 3 해결: REVIEW_PENDING, APPROVED 만 재사용)
+            # 재스캔 시 이미 등록되어 검토/승인 대기 중인 항목 처리 (Codex finding 3 해결)
             if existing_entry and existing_entry.state in (
                 State.REVIEW_PENDING,
                 State.APPROVED,
@@ -707,9 +711,13 @@ class Pipeline:
             )
 
             # 3. 보호 (Backup)
+            # 불변 고유 백업 경로 할당: 이전 세대 백업 파일 덮어쓰기 방지 (Codex finding 1 해결)
             backup_target = self.backup_dir / actual_rel
+            if backup_target.exists() and compute_sha256(backup_target) != sha256:
+                stem = Path(actual_rel).stem
+                backup_target = self.backup_dir / f"{stem}__{sha256[:8]}.pdf"
+
             backup_target.parent.mkdir(parents=True, exist_ok=True)
-            # 이미 백업이 존재하고 해시가 일치하면 재복사 생략 (BACKED_UP 상태에서 중단 후 재개 시)
             if not backup_target.exists() or compute_sha256(backup_target) != sha256:
                 shutil.copy2(path, backup_target)
             backup_sha256 = compute_sha256(backup_target)
@@ -723,7 +731,7 @@ class Pipeline:
                 )
 
             # 4. 추출 (OCR & 제목)
-            # OCR 엔진 미설정 시 fail-closed 정책 (Codex finding 1 해결: OCR 필수이므로 엔진 없이 성공 위장 금지)
+            # OCR 엔진 미설정 시 fail-closed 정책 (Codex finding 1 해결)
             if self.ocr_engine is None:
                 ocr_res = OcrResult(
                     status=OcrStatus.FAILED,
@@ -933,14 +941,20 @@ class Pipeline:
             if entry.state != State.APPROVED:
                 self.journal.record_approved(entry.input_rel)
 
-            # 2. 배치할 소스 파일 결정 (OCR 결과물 우선, 없으면 백업본)
+            # 2. 배치할 소스 파일 결정 (OCR 필수 정책: ALREADY_TEXT 가 아닌 경우 OCR 산출물 필수)
+            # Codex finding 3 해결: 산출물 누락 시 텍스트층 없는 백업본으로의 조용한 폴백 거부
             source_pdf: Path
-            if entry.ocr_output_path and Path(entry.ocr_output_path).exists():
+            if entry.ocr_status == OcrStatus.ALREADY_TEXT:
+                if entry.backup_path and Path(entry.backup_path).exists():
+                    source_pdf = Path(entry.backup_path)
+                else:
+                    source_pdf = src_input
+            elif entry.ocr_output_path and Path(entry.ocr_output_path).exists():
                 source_pdf = Path(entry.ocr_output_path)
-            elif entry.backup_path and Path(entry.backup_path).exists():
-                source_pdf = Path(entry.backup_path)
             else:
-                source_pdf = src_input
+                reason = f"OCR 산출물 누락: {entry.input_rel}의 OCR 산출물이 존재하지 않아 완료할 수 없습니다 (OCR 필수 정책 위반 방지)."
+                self.journal.record_failed(entry.input_rel, reason=reason)
+                raise FileNotFoundError(reason)
 
             # 3. 임시 파일 생성 (done_dir 내 .tmp 파일)
             target_name = entry.final_name or entry.proposed_name or f"scan__{entry.original_sha256[:8]}.pdf"
@@ -965,7 +979,7 @@ class Pipeline:
                 )
                 continue
 
-            # expected_final_sha256 와 intended_final_path 를 기록하여 크래시 복구 시 신뢰 검증 보장 (Codex finding 2 해결)
+            # expected_final_sha256 와 intended_final_path 를 기록하여 크래시 복구 시 신뢰 검증 보장
             self.journal.record_publishing(
                 entry.input_rel,
                 temp_path=temp_target,
@@ -1085,7 +1099,6 @@ class Pipeline:
                 final_p = self.done_dir / (entry.final_path or "")
                 if final_p.exists() and compute_sha256(final_p) == entry.final_sha256:
                     if src_input and src_input.exists():
-                        # 안전 검증: 입력 파일이 변경되었는지 확인
                         src_hash = compute_sha256(src_input)
                         if src_hash != entry.original_sha256:
                             reason = "복구 중단: 입력 파일 내용이 변경되어 삭제를 중단하고 보존함"
@@ -1102,14 +1115,13 @@ class Pipeline:
                     entry.state = State.APPROVED
                     recovered.append(entry.input_rel)
 
-            # 2. 임시 파일 생성 중 중단된 상태 (PUBLISHING) (Codex finding 2 해결)
+            # 2. 임시 파일 생성 중 중단된 상태 (PUBLISHING)
             elif entry.state == State.PUBLISHING:
                 intended_p = (
                     self.done_dir / entry.intended_final_path
                     if entry.intended_final_path
                     else None
                 )
-                # 최종본 경로에 파일이 존재하고, 기대 해시(expected_final_sha256)와 정확히 일치할 때만 발행 완료로 인정
                 if (
                     intended_p
                     and intended_p.exists()
@@ -1136,14 +1148,12 @@ class Pipeline:
                     )
                     recovered.append(entry.input_rel)
                 elif intended_p and intended_p.exists():
-                    # 파일은 존재하나 기대 해시와 다름 -> 충돌로 보존하고 덮어쓰지 않음
                     self.journal.record_held(
                         entry.input_rel,
                         reason=f"복구 충돌: 대상 경로({entry.intended_final_path})에 다른 내용의 파일이 존재합니다.",
                     )
                     recovered.append(entry.input_rel)
                 else:
-                    # 배치가 완료되지 않았음 -> APPROVED 로 롤백
                     entry.state = State.APPROVED
                     recovered.append(entry.input_rel)
 

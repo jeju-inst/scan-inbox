@@ -740,3 +740,108 @@ def test_pipeline_new_document_under_completed_name(env_dirs):
     assert not doc.exists()
 
 
+def test_pipeline_generation_specific_backup_preserved(env_dirs):
+    """P1: 동일 파일명의 새 문서 도착 시 이전 세대의 백업본이 보존되는지 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "reuse.pdf", "1세대 원본")
+    sha1 = compute_sha256(doc)
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe.scan()
+    pipe.apply(approve_all=True)
+
+    old_entry = pipe.journal.get_entry("reuse.pdf")
+    old_backup = Path(old_entry.backup_path)
+    assert old_backup.exists()
+    assert compute_sha256(old_backup) == sha1
+
+    # 2세대 문서 투입
+    make_pdf(doc, "2세대 다른 내용의 원본")
+    sha2 = compute_sha256(doc)
+
+    pipe.scan()
+    pipe.apply(approve_all=True)
+
+    # 이전 1세대의 백업 파일 내용이 보존되어 있어야 함 (덮어쓰기 없음)
+    assert old_backup.exists()
+    assert compute_sha256(old_backup) == sha1
+
+    # 2세대의 백업도 별도로 보존되어 있어야 함
+    new_entry = pipe.journal.get_entry("reuse.pdf")
+    new_backup = Path(new_entry.backup_path)
+    assert new_backup.exists()
+    assert compute_sha256(new_backup) == sha2
+    assert old_backup != new_backup
+
+
+def test_pipeline_archive_key_persistence(env_dirs):
+    """P2: JsonFileJournal 직렬화/역직렬화 시 아카이브 키와 신규 엔트리가 모두 보존되는지 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "archive_test.pdf", "1세대")
+
+    pipe1 = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe1.scan()
+    pipe1.apply(approve_all=True)
+
+    # 2세대 투입
+    make_pdf(doc, "2세대 새로운 내용")
+    pipe1.scan()
+
+    # 새 파이프라인 인스턴스 (저널 파일에서 재로드)
+    pipe2 = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    entries = pipe2.journal.list_entries()
+    # 아카이브된 1세대 엔트리와 현재 2세대 엔트리가 모두 존재해야 함 (총 2건)
+    assert len(entries) == 2
+    states = {e.state for e in entries}
+    assert State.COMPLETED in states
+    assert State.REVIEW_PENDING in states
+
+
+def test_pipeline_rejects_missing_ocr_output(env_dirs):
+    """P1: OK 상태에서 OCR 산출물 누락 시 원본 백업으로 조용히 완료하지 않고 거부 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "missing_ocr_artifact.pdf", "OCR 누락 문서")
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe.scan()
+    pipe.approve("missing_ocr_artifact.pdf")
+
+    entry = pipe.journal.get_entry("missing_ocr_artifact.pdf")
+    # 인위적으로 OCR 임시 산출물 삭제
+    if entry.ocr_output_path and Path(entry.ocr_output_path).exists():
+        Path(entry.ocr_output_path).unlink()
+
+    # apply 시도 시 FileNotFoundError 로 거부되어야 함
+    with pytest.raises(FileNotFoundError, match="OCR 산출물 누락"):
+        pipe.apply(targets=["missing_ocr_artifact.pdf"])
+
+    # 입력 파일이 지워지지 않고 보존됨
+    assert doc.exists()
+    assert entry.state == State.FAILED
+
+
+
