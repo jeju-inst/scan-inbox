@@ -695,3 +695,79 @@ def test_pipeline_preserves_filesystem_nfd_path(tmp_path):
     assert not f1.exists()
 
 
+def test_pipeline_rename_approved_record_again(tmp_path):
+    """이미 APPROVED 상태인 레코드에 대해 다시 rename() 을 호출해도 IllegalTransition 없이 새 이름으로 갱신됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    f1 = in_dir / "doc.pdf"
+    make_pdf(f1, "문서")
+    pipe.scan()
+
+    # 1차 승인 및 이름 변경
+    rec1 = pipe.rename("doc.pdf", "첫번째_이름.pdf")
+    assert rec1.state == State.APPROVED
+
+    # 2차 이름 변경 시 APPROVED -> APPROVED 전이 에러 없이 plan_json 이 정상 갱신되어야 함
+    rec2 = pipe.rename("doc.pdf", "수정된_최종_이름.pdf")
+    assert rec2.state == State.APPROVED
+    plan = json.loads(rec2.plan_json)
+    assert plan["proposed_name"] == "수정된_최종_이름.pdf"
+
+    # apply 실행 시 2차로 변경된 이름으로 배치되어야 함
+    applied = pipe.apply()
+    assert applied == ["doc.pdf"]
+    assert (done_dir / "수정된_최종_이름.pdf").exists()
+
+
+def test_pipeline_publish_does_not_clobber_existing_file(tmp_path):
+    """완료함에 임의의 파일이 존재하더라도 발행 과정에서 배타적 임시 파일을 사용하여 기존 파일이 손상되지 않음을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    # 완료함에 .tmp_result.pdf 및 다른 완료 파일이 이미 존재함
+    existing_file = done_dir / ".tmp_result.pdf"
+    make_pdf(existing_file, "보존되어야 하는 기존 완료 파일")
+    existing_hash = sha256_file(existing_file)
+
+    # 새로운 문서 result.pdf 를 스캔하고 apply
+    f1 = in_dir / "doc.pdf"
+    make_pdf(f1, "신규 문서")
+    pipe.scan()
+    pipe.rename("doc.pdf", "result.pdf")
+    pipe.apply()
+
+    # 기존 existing_file 이 덮어쓰여지거나 손상되지 않고 온전히 남아있어야 함
+    assert existing_file.exists()
+    assert sha256_file(existing_file) == existing_hash
+    assert (done_dir / "result.pdf").exists()
+
+    # recover() 를 돌려도 existing_file 이 오인 삭제되지 않아야 함
+    pipe.recover()
+    assert existing_file.exists()
+    assert sha256_file(existing_file) == existing_hash
+
+
+

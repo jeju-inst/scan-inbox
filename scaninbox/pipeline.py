@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -354,6 +355,8 @@ class Pipeline:
         rec = self._find_latest_record(input_rel)
         if not new_name.lower().endswith(".pdf"):
             new_name = f"{new_name}.pdf"
+        if new_name.startswith("."):
+            raise ValueError(f"숨김 파일명은 지정할 수 없습니다: {new_name}")
         if not is_safe_component(new_name):
             raise ValueError(f"안전하지 않은 파일명입니다: {new_name}")
 
@@ -366,12 +369,19 @@ class Pipeline:
         plan_dict["proposed_name"] = new_name
         plan_dict["needs_review"] = False
 
-        return self.journal.transition(
-            rec.id,
-            State.APPROVED,
-            approved_by_user=True,
-            plan_json=json.dumps(plan_dict, ensure_ascii=False),
-        )
+        if rec.state == State.APPROVED:
+            return self.journal.update_fields(
+                rec.id,
+                plan_json=json.dumps(plan_dict, ensure_ascii=False),
+                note="승인 항목 파일명 수정",
+            )
+        else:
+            return self.journal.transition(
+                rec.id,
+                State.APPROVED,
+                approved_by_user=True,
+                plan_json=json.dumps(plan_dict, ensure_ascii=False),
+            )
 
     def hold(self, input_rel: str, reason: str = "사용자 보류") -> FileRecord:
         """항목 보류 처리."""
@@ -456,16 +466,18 @@ class Pipeline:
                 self.journal.transition(rec.id, State.FAILED, reason=reason)
                 raise FileNotFoundError(reason)
 
-            # 4. 임시 파일 생성 및 검증
+            # 5. 배타적 임시 파일 생성 및 검증 (기존 파일 덮어쓰기 완전 방지)
             target_name = plan_data.get("proposed_name") or f"{rec.original_sha256[:8]}.pdf"
             final_rel = unique_name(self.done_dir, target_name)
-            tmp_target = self.done_dir / f".tmp_{final_rel}"
+            pub_token = f".scaninbox_pub_{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex[:8]}.tmp"
+            tmp_target = self.done_dir / pub_token
 
-            import shutil
-            shutil.copy2(source_pdf, tmp_target)
+            with open(tmp_target, "xb") as f_out, open(source_pdf, "rb") as f_in:
+                shutil.copyfileobj(f_in, f_out)
+            shutil.copystat(source_pdf, tmp_target)
             final_sha256 = sha256_file(tmp_target)
 
-            # 5. 규약 4: PUBLISHING 전에 final_rel/final_sha256 기록 후 pathsafe.move_no_overwrite 로 배치
+            # 6. 규약 4: PUBLISHING 전에 final_rel/final_sha256 기록 후 pathsafe.move_no_overwrite 로 배치
             rec = self.journal.transition(
                 rec.id, State.PUBLISHING, final_rel=final_rel, final_sha256=final_sha256
             )
@@ -536,8 +548,8 @@ class Pipeline:
 
     def recover(self) -> list[str]:
         """장애 복구 (규약 3: journal.recover 후 입력 정리 대기 건 처리)."""
-        # 남아있는 임시 파일 정리
-        for tmp in self.done_dir.glob(".tmp_*"):
+        # 남아있는 Scan Inbox 발행 임시 파일 정리
+        for tmp in self.done_dir.glob(".scaninbox_pub_*.tmp"):
             try:
                 tmp.unlink()
             except Exception:

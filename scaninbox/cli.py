@@ -15,12 +15,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from scaninbox.config import Config, default_backup_dir, default_done_dir
+from scaninbox.config import (
+    Config,
+    app_data_dir,
+    default_backup_dir,
+    default_done_dir,
+)
 from scaninbox.contracts import OcrStatus, State
 from scaninbox.ocr import OcrmypdfEngine
 from scaninbox.pipeline import Pipeline
@@ -31,7 +37,14 @@ def _create_pipeline(args: argparse.Namespace) -> Pipeline:
     scan_dir = Path(args.input_dir).resolve() if args.input_dir else Path("./input").resolve()
     done_dir = Path(args.done_dir).resolve() if args.done_dir else default_done_dir(scan_dir)
     backup_dir = Path(args.backup_dir).resolve() if args.backup_dir else default_backup_dir(scan_dir)
-    cfg = Config.with_defaults(scan_dir=scan_dir, done_dir=done_dir, backup_dir=backup_dir)
+    ws_hash = hashlib.sha256(str(scan_dir).encode("utf-8")).hexdigest()[:12]
+    journal_path = app_data_dir() / f"journal_{ws_hash}.sqlite"
+    cfg = Config.with_defaults(
+        scan_dir=scan_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=journal_path,
+    )
     engine = OcrmypdfEngine()
     title_ext = RuleTitleExtractor()
     return Pipeline(config=cfg, ocr_engine=engine, title_extractor=title_ext)

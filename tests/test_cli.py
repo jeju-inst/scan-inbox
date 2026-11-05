@@ -258,3 +258,21 @@ def test_cli_export_ledger(cli_env, tmp_path, capsys):
     assert ledger_file.exists()
     file_data = json.loads(ledger_file.read_text(encoding="utf-8"))
     assert file_data == data
+
+
+def test_cli_scopes_journal_per_workspace(tmp_path):
+    """서로 다른 input-dir 에 대해 각각 격리된 journal_path 가 할당되어 충돌하지 않음을 검증."""
+    in_dir1 = tmp_path / "ws1_in"
+    in_dir2 = tmp_path / "ws2_in"
+    in_dir1.mkdir()
+    in_dir2.mkdir()
+
+    parser = cli.build_parser()
+    args1 = parser.parse_args(["--input-dir", str(in_dir1), "init"])
+    pipe1 = cli._create_pipeline(args1)
+
+    args2 = parser.parse_args(["--input-dir", str(in_dir2), "init"])
+    pipe2 = cli._create_pipeline(args2)
+
+    assert pipe1.journal.path != pipe2.journal.path
+
