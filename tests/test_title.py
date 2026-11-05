@@ -98,7 +98,8 @@ def test_corpus_samples_never_confident_and_wrong():
     """오답을 자신 있게 내지 않는다: 자동 승인 후보(제목 있음, 검토 사유 없음)는 전부 정답이어야 한다."""
     tot, detail = _measure()
     assert tot["wrong"] == 0, [(d[0], d[1], d[3].title) for d in detail if d[4] == "wrong"]
-    # 학습 표본 위의 측정값(2026-11-05): 정확 16 / 오답 0 / 검토 5 (21건, 검토 대상 정답 3건 포함).
+    # 학습 표본 위의 측정값(2026-11-05, macOS): 정확 16 / 오답 0 / 검토 5 (21건, 검토 대상 정답 3건 포함).
+    # 같은 코퍼스를 Windows(Tesseract 5.4.0)에서 OCR 하면 OCR 이 제목을 더 자주 놓쳐 정확 11 / 오답 0 / 검토 10.
     assert tot["correct"] >= 16 and sum(tot.values()) == 21
 
 
@@ -122,6 +123,23 @@ def test_ocr_lost_title_goes_to_review_with_candidate_kept_for_screen():
     assert p.title is None and p.review_reasons and p.evidence_page == 1
     assert "20264" in p.evidence_snippet and len(p.evidence_snippet) <= 80
     assert p.doc_date == "2026-03-12"
+
+
+# Windows 11 x64(Tesseract 5.4.0, 맑은 고딕 합성 코퍼스)에서 OCR 한 결과 중 규칙이 처음에 자신 있게 틀렸던 두 건.
+# 하나는 제목이 사라진 쪽의 본문 문장, 하나는 제목 뒤에 잡티가 만든 라틴 글자가 붙은 경우였다.
+WIN_WRONG_CASES = [
+    ["예 시시 가 상 과\n2026. 2. 17. \nA \n= \nrat \not \n고\n교\nica \nHI \nKI \n"
+     "현장 점검 결과를 정리함. 2 쪽은 빈 페이지, 3 쪽은 엮으로 스 캔된 쪽 , 4 쪽 은 PDF 회전 속 성 이 있는\n쪽임 . : \n"],
+    ["예 시 시 가 상 과\n긴 경로 시험 문서ro \n2026. 9. 10. \n일시: 20264 9 월 108 오후 2 시 / 장소: 가상 회의실 4 \n"
+     "참석자: 담당자 가, 담당자 나, 담당자 다 (모두 가상 인물) \n"],
+]
+
+
+@pytest.mark.parametrize("pages", WIN_WRONG_CASES)
+def test_windows_ocr_regressions_are_not_accepted(pages):
+    p = EX.propose(None, pages)
+    assert p.title is None and p.review_reasons  # 오답을 제목으로 내지 않고 검토로 넘긴다
+    assert p.evidence_snippet  # 화면용 후보는 남긴다
 
 
 # ---- 표본에 없는 문서 모양(일반화 확인) --------------------------------------------------------------------

@@ -38,6 +38,7 @@ _LABEL_RE = re.compile(r"^[^\s:：]{1,8}(\s[^\s:：]{1,6})?\s*[:：]")
 _NUMBERED_RE = re.compile(r"^(\d{1,2}[.,)]|[가-하][.)]|[①-⑩]|\(\d{1,2}\))\s*\S")
 _ATTACH_RE = re.compile(r"^\[?\s*(붙\s*임|별\s*첨|첨\s*부)")
 _KO_SENTENCE_END_RE = re.compile(r"(함|음|임|됨|다|요|니다|합니다|입니다|바랍니다)\s*[.。]\s*$")
+_KO_SENTENCE_MID_RE = re.compile(r"(함|음|임|됨)\s*[.。]\s*\S")
 _SENTENCE_END_RE = re.compile(r"(함|음|임|됨|다|요|니다|합니다|입니다|바랍니다)\s*[.。]\s*$|[.!?]\s*$")
 _STRAY_RE = re.compile(r"[\[\]{}|&=^$~!@#<>\\`]")
 _TITLE_LABEL_RE = re.compile(r"^제\s*목\s*[:：]\s*(.+)$")
@@ -146,6 +147,9 @@ def _title_noise(line: str) -> Optional[str]:
                 return "제목 후보에 한글과 섞인 2자 이하 라틴 조각이 있음"
             if re.fullmatch(r"[a-z]{3}", t):
                 return "제목 후보에 한글과 섞인 소문자 3자 라틴 조각이 있음"
+    for t in toks:  # 한글에 붙은 소문자 라틴 꼬리/머리('문서ro'): 도장·잡티가 만든 글자
+        if re.search(r"[가-힣][a-z]{1,3}$", t) or re.search(r"^[a-z]{1,3}[가-힣]", t):
+            return "제목 후보에 한글에 붙은 소문자 라틴 조각이 있음"
     if re.search(r"\d{5,}", line):
         return "제목 후보에 비정상적인 긴 숫자열이 있음"
     return None
@@ -157,8 +161,10 @@ def _title_like(line: str) -> bool:
         return False
     if not (re.search(r"[가-힣]{3,}", c) or len(re.findall(r"[A-Za-z]{3,}", line)) >= 2):
         return False
-    if _KO_SENTENCE_END_RE.search(line.strip()):
-        return False  # 한국어 문장 종결 + 마침표는 본문
+    if _KO_SENTENCE_END_RE.search(line.strip()) or _KO_SENTENCE_MID_RE.search(line):
+        return False  # 한국어 문장 종결 + 마침표는 본문(줄 중간에 문장이 끝나는 경우 포함)
+    if re.search(r"[,，]", line) or len(line.split()) >= 9:
+        return False  # 쉼표가 있거나 단어가 아주 많은 줄은 본문 문장일 가능성이 크다(제목이면 검토로 넘어감)
     if _SENTENCE_END_RE.search(line.strip()) and len(line.split()) >= 5:
         return False  # 영어 문장
     return True
