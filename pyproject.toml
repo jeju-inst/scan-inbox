@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scaninbox-corpus"
+version = "0.1.0"
+description = "Scan Inbox 합성 코퍼스 생성기와 인수 검증 하네스 (완전 가상 문서만 생성)"
+readme = "scaninbox_corpus/README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# 의존성은 검증한 버전으로 고정한다 (2026-11-05, Python 3.14 / macOS arm64).
+dependencies = [
+  "pillow==13.0.0",
+  "reportlab==5.1.0",
+  "pypdf==6.21.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.2.0",
+  "jsonschema==4.26.0",
+]
+
+[project.scripts]
+scaninbox-corpus = "scaninbox_corpus.generate:main"
+scaninbox-reconcile = "scaninbox_corpus.reconcile:main"
+scaninbox-snapshot = "scaninbox_corpus.snapshot:main"
+
+[tool.setuptools]
+packages = ["scaninbox_corpus"]
+
+[tool.setuptools.package-data]
+scaninbox_corpus = ["schema/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
