@@ -472,3 +472,157 @@ def test_pipeline_export_ledger_and_reconcile_match(work, tmp_path):
     res = reconcile.reconcile(manifest, ledger, in_dir, done_dir)
     assert res["errors"] == []
     assert res["ok"] is True
+
+
+def test_pipeline_json_file_journal_persistence(env_dirs):
+    """P1: CLI 다중 실행 간 상태 영속화 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "persist_test.pdf", "영속성 시험")
+
+    # 1차 파이프라인 인스턴스 (스캔 및 승인)
+    p1 = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    p1.scan()
+    p1.approve("persist_test.pdf")
+
+    # 2차 파이프라인 인스턴스 (새 인스턴스에서 apply)
+    p2 = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    # 이전 상태가 journal.json 에서 로드되어 있어야 함
+    entry = p2.journal.get_entry("persist_test.pdf")
+    assert entry is not None
+    assert entry.state == State.APPROVED
+
+    applied = p2.apply(targets=["persist_test.pdf"])
+    assert applied == ["persist_test.pdf"]
+    assert not doc.exists()
+
+
+def test_pipeline_recover_preserves_modified_source_input(env_dirs):
+    """P1: recover 시 입력 파일이 변경된 경우 삭제하지 않고 HELD 보존 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "replace_test.pdf", "최초 내용")
+    orig_sha256 = compute_sha256(doc)
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe.scan()
+
+    final_name = f"2026-11-05_최종본__{orig_sha256[:8]}.pdf"
+    final_p = done_dir / final_name
+    shutil.copy2(doc, final_p)
+
+    entry = pipe.journal.get_entry("replace_test.pdf")
+    entry.state = State.PUBLISHED
+    entry.final_path = final_name
+    entry.final_sha256 = compute_sha256(final_p)
+
+    # 입력 파일이 그사이에 새로운 내용으로 교체/수정됨
+    doc.write_bytes(b"%PDF-1.4 completely new unbacked content")
+
+    # recover 실행: 입력 파일이 삭제되지 않고 HELD 상태로 보존되어야 함
+    rec = pipe.recover()
+    assert "replace_test.pdf" in rec
+    assert doc.exists()  # 내용 보존!
+    assert entry.state == State.HELD
+    assert "변경" in entry.reason
+
+
+def test_pipeline_rescan_handles_pending_files(env_dirs):
+    """P2: 대기 중인 파일이 있을 때 rescan 시 오류 없이 기존 항목 유지 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    f1 = make_pdf(in_dir / "pending1.pdf", "대기 문서 1")
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+
+    items1 = pipe.scan()
+    assert len(items1) == 1
+    assert items1[0].input_rel == "pending1.pdf"
+
+    # 새 파일 추가 후 재스캔
+    f2 = make_pdf(in_dir / "new_doc.pdf", "새 문서 2")
+    items2 = pipe.scan()
+    # 기존 대기 항목 + 새 항목 총 2건이 에러 없이 발견되어야 함
+    assert len(items2) == 2
+    assert {it.input_rel for it in items2} == {"pending1.pdf", "new_doc.pdf"}
+
+
+def test_pipeline_unicode_nfd_filename_resolution(env_dirs):
+    """P2: NFD 자모 분리 파일명도 정상 발견 및 처리되는지 검증."""
+    import unicodedata
+
+    in_dir, done_dir, backup_dir = env_dirs
+    # '한글문서' 를 NFD 로 인코딩한 파일명 생성
+    nfd_name = unicodedata.normalize("NFD", "한글문서.pdf")
+    nfd_path = in_dir / nfd_name
+    make_pdf(nfd_path, "한글 NFD 테스트 문서")
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+
+    items = pipe.scan()
+    assert len(items) == 1
+
+    applied = pipe.apply(approve_all=True)
+    assert len(applied) == 1
+    # 파일시스템에서 원래 NFD 파일이 정상 삭제되고 완료 폴더에 배치되었는지 확인
+    assert not nfd_path.exists()
+    assert len(list(done_dir.glob("*.pdf"))) == 1
+
+
+def test_pipeline_recover_publishing_reconciles_published_file(env_dirs):
+    """P2: PUBLISHING 도중 이미 최종본이 이동된 후 크래시 시 중복 없이 완료 복구 검증."""
+    in_dir, done_dir, backup_dir = env_dirs
+    doc = make_pdf(in_dir / "crash_publishing.pdf", "발행 중단 시험")
+    orig_sha256 = compute_sha256(doc)
+
+    pipe = Pipeline(
+        input_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    pipe.scan()
+
+    intended_name = f"2026-11-05_발행문서__{orig_sha256[:8]}.pdf"
+    intended_p = done_dir / intended_name
+    shutil.copy2(doc, intended_p)
+
+    entry = pipe.journal.get_entry("crash_publishing.pdf")
+    entry.state = State.PUBLISHING
+    entry.intended_final_path = intended_name
+
+    rec = pipe.recover()
+    assert "crash_publishing.pdf" in rec
+    assert not doc.exists()  # 입력 파일 정리됨
+    assert intended_p.exists()
+    assert len(list(done_dir.glob("*.pdf"))) == 1  # 접미사 붙은 중복 파일 없음!
+    assert entry.state == State.COMPLETED
+
