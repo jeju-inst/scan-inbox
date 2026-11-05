@@ -1,0 +1,20 @@
+# G0 시험 1단계: 입력 PDF 의 원본 백업(해시 이름)과 OCR 사본 생성. 입력은 건드리지 않는다.
+# 실행: G0RUN=<작업 루트> TESSDATA_PREFIX=<tessdata> PATH=<venv>/bin:$PATH organize sim|run stage1-ocr-backup.yaml
+# G0RUN 아래: inbox/(입력 모사) originals/ work/ done/ review/
+rules:
+  - name: backup-and-ocr
+    locations:
+      - path: "{env.G0RUN}/inbox"
+        max_depth: 10
+    subfolders: true
+    filters:
+      - extension: pdf
+      - hash:
+          algorithm: sha256
+    actions:
+      # 파일명은 셸 명령에 그대로 보간된다(따옴표 필요). 악성 파일명 방어는 이 설정에 없다.
+      - shell:
+          cmd: >-
+            mkdir -p "{env.G0RUN}/originals" "{env.G0RUN}/work" &&
+            cp -n "{path}" "{env.G0RUN}/originals/{hash}.pdf" &&
+            ocrmypdf -l kor+eng --skip-text --rotate-pages "{path}" "{env.G0RUN}/work/{hash}.pdf"
