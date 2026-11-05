@@ -49,10 +49,13 @@ n = len(PdfReader(src).pages)
 blank = {int(x) for x in os.environ.get("FAKE_BLANK", "").split(",") if x}
 if mode == "pagecount":
     n += 1
+thr = args[args.index("--rotate-pages-threshold") + 1] if "--rotate-pages-threshold" in args else "?"
+if os.environ.get("FAKE_CALLS_FILE"):
+    open(os.environ["FAKE_CALLS_FILE"], "a").write(thr + "\n")
 c = canvas.Canvas(dst)
 for i in range(1, n + 1):
     if i not in blank:
-        c.drawString(72, 700, f"Recognized text on page {i} with enough characters here.")
+        c.drawString(72, 700, f"Recognized text on page {i} thr={thr} with enough characters here.")
     c.showPage()
 c.save()
 '''
@@ -294,6 +297,47 @@ def test_log_has_no_body_text(fake_env, tmp_path, caplog):
     assert "Recognized text" not in caplog.text
 
 
+def test_retry_with_lower_threshold_when_suspect_pages(fake_env, tmp_path, monkeypatch):
+    """첫 결과에 의심 쪽이 있으면 낮은 임계값으로 재실행해 문제 쪽이 더 적은 결과를 채택한다."""
+    import scaninbox.ocr as ocr_mod
+    eng, tp = fake_env
+    calls = tp / "calls.txt"
+    monkeypatch.setenv("FAKE_CALLS_FILE", str(calls))
+    # 임계값 1.2 로 만든 출력은 2쪽이 의심, 0.5 로 만든 출력은 정상이라고 판정하는 가짜 판정기
+    monkeypatch.setattr(ocr_mod, "suspect_pages", lambda texts: [2] if any("thr=1.2" in t for t in texts) else [])
+    res = eng.run(_image_only_pdf(tp / "in.pdf", pages=2), tp / "out")
+    assert calls.read_text().split() == ["1.2", "0.5"]
+    assert res.status is OcrStatus.OK and "0.5" in res.reason and "rotate-threshold=0.5" in res.engine
+    assert len(list((tp / "out").glob("*.pdf"))) == 1  # 채택되지 않은 첫 출력은 지워진다
+
+
+def test_retry_not_adopted_when_not_better(fake_env, tmp_path, monkeypatch):
+    import scaninbox.ocr as ocr_mod
+    eng, tp = fake_env
+    calls = tp / "calls.txt"
+    monkeypatch.setenv("FAKE_CALLS_FILE", str(calls))
+    monkeypatch.setattr(ocr_mod, "suspect_pages", lambda texts: [2])  # 어떤 임계값에서도 의심 쪽 1개
+    res = eng.run(_image_only_pdf(tp / "in.pdf", pages=2), tp / "out")
+    assert calls.read_text().split() == ["1.2", "0.5"]
+    assert res.status is OcrStatus.PARTIAL and "rotate-threshold=1.2" in res.engine
+    assert len(list((tp / "out").glob("*.pdf"))) == 1
+
+
+def test_no_retry_without_suspect_or_when_disabled(fake_env, tmp_path, monkeypatch):
+    import scaninbox.ocr as ocr_mod
+    eng, tp = fake_env
+    calls = tp / "calls.txt"
+    monkeypatch.setenv("FAKE_CALLS_FILE", str(calls))
+    monkeypatch.setenv("FAKE_BLANK", "2")  # 빈 쪽만 있는 경우는 재시도로 나아지지 않는다
+    eng.run(_image_only_pdf(tp / "in.pdf", pages=2), tp / "out")
+    assert calls.read_text().split() == ["1.2"]
+    calls.unlink()
+    monkeypatch.setattr(ocr_mod, "suspect_pages", lambda texts: [1])
+    eng2 = OcrmypdfEngine(eng._cmd, tesseract_dir=eng._tess_dir, retry_rotate_thresholds=())
+    eng2.run(_image_only_pdf(tp / "in2.pdf", pages=2), tp / "out2")
+    assert calls.read_text().split() == ["1.2"]
+
+
 # ---- 텍스트 품질 판정(쓰레기 쪽) ---------------------------------------------------------------------
 
 # G0 에서 90도 회전된 합성 쪽을 임계값 12 로 읽었을 때 나온 쓰레기 텍스트(내용은 합성 문서의 오인식).
@@ -379,17 +423,20 @@ def test_real_corpus_statuses(corpus150, tmp_path):
     assert {2, 5} <= set(res.empty_pages)
 
 
-def test_rotate_threshold_band(corpus150, tmp_path):
-    """DEFAULT_ROTATE_THRESHOLD(1.2) 선택 근거의 재현. 이미지가 90도 회전된 3쪽이 교정되어 읽혀야 하고,
-    빈 쪽(2·5)은 회전으로 텍스트가 생기지 않아야 한다. 값은 합성 코퍼스·이 엔진 버전에서의 관찰이다."""
+def test_rotate_behavior_with_default_engine(corpus150, tmp_path):
+    """이미지가 90도 회전된 3쪽이 읽을 수 있게 교정돼야 하고, 빈 쪽(2·5)은 텍스트가 없어야 한다.
+
+    첫 실행 임계값(1.2)만으로 교정되는지는 플랫폼에 따라 다르다(macOS/Tesseract 5.5.3 은 교정, Windows/5.4.0 은
+    교정 실패 -> 재시도 임계값 0.5 로 교정). 어느 쪽이든 기본 엔진의 최종 결과는 3쪽이 교정되어야 한다."""
     from scaninbox_corpus.content import doc_rotation_case
     src = _by_category(corpus150, "rotated_blank")
     doc = doc_rotation_case()
-    res = _real_engine(rotate_threshold=DEFAULT_ROTATE_THRESHOLD).run(src, tmp_path / "out", timeout_s=300)
-    assert _recall(_page_truth(doc, 3), res.text_by_page[2]) >= 0.6
+    res = _real_engine().run(src, tmp_path / "out", timeout_s=600)
+    assert _recall(_page_truth(doc, 3), res.text_by_page[2]) >= 0.6, res.reason
     assert 3 not in suspect_pages(res.text_by_page)
     assert res.text_by_page[1] == "" and res.text_by_page[4] == ""
-    # 참고: 임계값 12(OCRmyPDF 기본)에서 3쪽 인식이 어떻게 되는지는 macOS 에서 0.06 이었다(쓰레기 112자).
-    # 플랫폼별로 달라질 수 있어 값을 단정하지 않고 결과가 정상 범주(OK/PARTIAL)인지만 확인한다.
-    res12 = _real_engine(rotate_threshold=12).run(src, tmp_path / "out", timeout_s=300)
-    assert res12.status in (OcrStatus.OK, OcrStatus.PARTIAL)
+    # PDF /Rotate 90 쪽(4쪽)은 재시도 후에도 읽혀야 한다(임계값이 너무 낮으면 악화되는 쪽)
+    assert _recall(_page_truth(doc, 4), res.text_by_page[3]) >= 0.6
+    # 재시도를 끈 엔진도 결과를 낸다. 플랫폼에 따라 3쪽이 의심 쪽으로 드러나거나(Windows) 교정된다(macOS).
+    res0 = _real_engine(retry_rotate_thresholds=()).run(src, tmp_path / "out", timeout_s=600)
+    assert res0.status is OcrStatus.PARTIAL and {2, 5} <= set(res0.empty_pages)

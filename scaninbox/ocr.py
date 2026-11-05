@@ -43,21 +43,28 @@ OCRMYPDF_PINNED = "17.13.0"
 
 #: ``--rotate-pages-threshold`` 기본값(방향 신뢰도 하한, OCRmyPDF 기본 12).
 #:
-#: 합성 코퍼스 ``rotated_blank``(빈 쪽 2, 이미지 90도 회전 쪽 1, PDF /Rotate 90 쪽 1)에서 macOS arm64,
-#: OCRmyPDF 17.13.0, Tesseract 5.5.3, tessdata_fast kor 4.1.0, ``--deskew`` 로 잰 값(``tests/test_ocr.py`` 에 재현):
+#: **단일 임계값이 플랫폼·Tesseract 버전을 가로질러 통하지 않는다.** 합성 코퍼스 ``rotated_blank``(빈 쪽 2, 이미지가
+#: 90도 회전된 3쪽, PDF /Rotate 90 인 4쪽)를 OCRmyPDF 17.13.0, ``--deskew``, tessdata_fast kor 4.1.0 으로 잰 글자
+#: 재현율(``tests/test_ocr.py`` 에 재현 가능한 값만 단정):
 #:
-#: ===========  ==========================  =============================
-#: 임계값       이미지 회전 쪽 글자 재현율  /Rotate 90 쪽 글자 재현율
-#: ===========  ==========================  =============================
-#: 12 ~ 4       0.06 (쓰레기 문자 112자)    1.00
-#: 2 ~ 1.0      0.89                        1.00
-#: 0.8 ~ 0.5    0.89                        0.03 (과회전으로 악화)
-#: ===========  ==========================  =============================
+#: ====================  ==================  =================  ==================
+#: 환경                  임계값              3쪽(이미지 회전)   4쪽(/Rotate 90)
+#: ====================  ==================  =================  ==================
+#: macOS arm64           12 ~ 4              0.06 (쓰레기)      1.00
+#: Tesseract 5.5.3       2 ~ 0.5             0.89               1.00 (0.8 이하는 0.03)
+#: Windows x64           12 ~ 0.8            0.05 (쓰레기)      1.00
+#: Tesseract 5.4.0       0.5                 0.78               1.00 (0.2 이하는 0.08)
+#: ====================  ==================  =================  ==================
 #:
-#: 즉 1.0~2.0 이 양쪽을 모두 살린다. Paperless 시험에서 잰 방향 신뢰도는 회전 쪽 1.43, 빈 쪽 0.83 이었으므로
-#: 두 값의 중간 근처인 1.2 를 골랐다(빈 쪽 과회전 여유 0.37, 회전 쪽 교정 여유 0.23). **합성 소표본 관찰값이며 실스캔
-#: 일반값이 아니다**(실문서 재측정 필요). 앱은 이 값과 무관하게 출력 텍스트를 다시 검증한다.
+#: macOS 는 1.0~2.0, Windows 는 0.5 근처(0.3~0.7 사이로 추정, 0.5 와 0.8·0.2 만 쟀음)에서만 두 쪽을 모두 살린다.
+#: 그래서 첫 실행은 1.2(Paperless 시험의 방향 신뢰도 회전 쪽 1.43·빈 쪽 0.83 의 중간 근처, 빈 쪽 과회전을 피함)로
+#: 하고, **결과에 인식 품질 의심 쪽이 있으면 0.5 로 한 번 더 실행해 문제 쪽이 더 적은 결과를 채택**한다
+#: (``DEFAULT_RETRY_THRESHOLDS``). 합성 소표본 관찰값이며 실스캔 일반값이 아니다(실문서 재측정 필요).
+#: 앱은 어느 경우에도 출력 텍스트를 다시 검증한다.
 DEFAULT_ROTATE_THRESHOLD = 1.2
+
+#: 첫 실행에서 의심 쪽이 나오면 시도할 낮은 임계값(위 표: Windows 에서 3쪽 교정, macOS 는 재시도 자체가 필요 없었음).
+DEFAULT_RETRY_THRESHOLDS: tuple[float, ...] = (0.5,)
 
 #: 이 글자 수(공백 제외) 이상이면 그 쪽에 텍스트층이 있다고 본다.
 MIN_PAGE_CHARS = 20
@@ -282,6 +289,8 @@ class OcrmypdfEngine:
     :param tesseract_dir: ``tesseract`` 실행 파일이 있는 폴더. 주면 하위 프로세스 PATH 앞에만 붙인다(전역 변경 없음).
     :param rotate_threshold: ``--rotate-pages-threshold`` 값. ``DEFAULT_ROTATE_THRESHOLD`` 주석 참조.
     :param jobs: ``-j`` 값. None 이면 OCRmyPDF 기본.
+    :param retry_rotate_thresholds: 첫 실행 결과에 인식 품질 의심 쪽이 있으면 이 임계값들로 차례로 다시 실행해 문제 쪽이
+        가장 적은 결과를 고른다(빈 튜플이면 재시도 없음). 근거는 ``DEFAULT_ROTATE_THRESHOLD`` 주석.
     :param extra_args: 추가 옵션. ``--oversample``·``--tesseract-pagesegmode`` 는 거절한다(G0 결과).
     """
 
@@ -289,7 +298,8 @@ class OcrmypdfEngine:
 
     def __init__(self, ocrmypdf_cmd: Optional[Sequence[str]] = None, *, tessdata_dir: Optional[Path] = None,
                  tesseract_dir: Optional[Path] = None, rotate_threshold: float = DEFAULT_ROTATE_THRESHOLD,
-                 jobs: Optional[int] = None, extra_args: Sequence[str] = ()) -> None:
+                 jobs: Optional[int] = None, extra_args: Sequence[str] = (),
+                 retry_rotate_thresholds: Sequence[float] = DEFAULT_RETRY_THRESHOLDS) -> None:
         for a in extra_args:
             if a.split("=", 1)[0] in self.FORBIDDEN_OPTIONS:
                 raise ValueError(f"금지된 OCR 옵션: {a} (G0 에서 인식률 악화 확인)")
@@ -302,6 +312,7 @@ class OcrmypdfEngine:
         self._rotate_threshold = rotate_threshold
         self._jobs = jobs
         self._extra = list(extra_args)
+        self._retry = [float(t) for t in retry_rotate_thresholds]
         self._env_cache: dict[str, str] = {}
 
     # ---- 환경 ---------------------------------------------------------------------------------
@@ -387,12 +398,32 @@ class OcrmypdfEngine:
         except OcrEnvironmentError as e:
             return OcrResult(OcrStatus.FAILED, page_count_in=pages_in, reason=str(e))
         dst_dir.mkdir(parents=True, exist_ok=True)
+
+        best = self._run_once(src, dst_dir, langs, pages_in, engine, self._rotate_threshold, timeout_s, cancel)
+        for thr in self._retry:
+            remaining = timeout_s - (time.monotonic() - t0)
+            if remaining < 5 or best.status not in (OcrStatus.OK, OcrStatus.PARTIAL) or not _has_suspect(best):
+                break
+            alt = self._run_once(src, dst_dir, langs, pages_in, engine, thr, int(remaining), cancel)
+            if alt.output is not None and _problem_pages(alt) < _problem_pages(best):
+                self._discard(best.output)
+                alt.reason = (alt.reason + "; " if alt.reason else "") + f"회전 임계값 {thr} 로 재실행한 결과를 채택"
+                best = alt
+            else:
+                self._discard(alt.output)
+        log.info("ocr status=%s pages=%d->%d empty=%d sec=%.1f", best.status.value, best.page_count_in,
+                 best.page_count_out, len(best.empty_pages), time.monotonic() - t0)
+        return best
+
+    def _run_once(self, src: Path, dst_dir: Path, langs: str, pages_in: int, engine: str, threshold: float,
+                  timeout_s: float, cancel: Optional[threading.Event]) -> OcrResult:
         out = dst_dir / f"ocr-{uuid.uuid4().hex[:12]}.pdf"
         argv = [*self._cmd, "-q", "--no-progress-bar", "-l", langs, "--skip-text", "--rotate-pages",
-                "--rotate-pages-threshold", str(self._rotate_threshold), "--deskew", "--output-type", "pdf"]
+                "--rotate-pages-threshold", str(threshold), "--deskew", "--output-type", "pdf"]
         if self._jobs:
             argv += ["-j", str(self._jobs)]
         argv += self._extra + [_arg_path(src), _arg_path(out)]
+        engine = f"{engine} rotate-threshold={threshold}"
         try:
             rc, why, tail = run_tree(argv, env=self._env(), timeout_s=timeout_s, cancel=cancel)
         except OSError as e:
@@ -400,16 +431,13 @@ class OcrmypdfEngine:
                              reason=f"OCRmyPDF 실행 실패({type(e).__name__})")
         if why != "exit":
             self._discard(out)
-            msg = f"시간 초과({timeout_s}초)로 중단" if why == "timeout" else "취소됨"
+            msg = f"시간 초과({int(timeout_s)}초)로 중단" if why == "timeout" else "취소됨"
             log.info("ocr %s pages=%d", why, pages_in)
             return OcrResult(OcrStatus.FAILED, page_count_in=pages_in, engine=engine, reason=msg)
         if rc != 0:
             self._discard(out)
             return self._map_failure(rc, tail, src, pages_in, engine)
-        result = self._verify(out, pages_in, engine)
-        log.info("ocr status=%s pages=%d->%d empty=%d sec=%.1f", result.status.value, result.page_count_in,
-                 result.page_count_out, len(result.empty_pages), time.monotonic() - t0)
-        return result
+        return self._verify(out, pages_in, engine)
 
     # ---- 단계 구현 ----------------------------------------------------------------------------
 
@@ -485,11 +513,23 @@ class OcrmypdfEngine:
                          reason=f"OCRmyPDF 실패(종료코드 {rc}) {tail}".strip())
 
     @staticmethod
-    def _discard(p: Path) -> None:
+    def _discard(p: Optional[Path]) -> None:
+        if p is None:
+            return
         try:
             p.unlink()
         except OSError:
             pass
+
+
+def _has_suspect(res: OcrResult) -> bool:
+    """결과에 '텍스트는 있으나 읽을 수 없어 보이는 쪽'이 있는지(재시도 조건). 사유 문자열 대신 본문으로 다시 판정."""
+    return bool(suspect_pages(res.text_by_page))
+
+
+def _problem_pages(res: OcrResult) -> int:
+    """문제 쪽 수(텍스트 0자 + 인식 품질 의심). 재시도 결과 비교 기준."""
+    return len(res.empty_pages) + len(suspect_pages(res.text_by_page))
 
 
 def _fmt_pages(pages: Sequence[int]) -> str:
