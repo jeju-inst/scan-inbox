@@ -120,3 +120,39 @@ def test_refuses_nonempty_output_without_force(tmp_path, font_available):
     generate(tmp_path / "o", dpi=60)
     with pytest.raises(SystemExit):
         generate(tmp_path / "o", dpi=60)
+
+
+def _ink_fraction(img) -> float:
+    g = img.convert("L")
+    px = g.get_flattened_data() if hasattr(g, "get_flattened_data") else g.getdata()
+    px = list(px)
+    return sum(1 for v in px if v < 110) / len(px)
+
+
+def test_image_pages_fit_mediabox_and_show_text(corpus):
+    """/Rotate 쪽을 포함해 이미지가 MediaBox 안에 온전히 그려지고(잘림 없음) 글자 잉크가 실제로 보인다."""
+    import re
+    out, manifest = corpus
+    rot_seen = 0
+    for e in manifest["files"]:
+        if e["category"] in ("corrupt_pdf", "encrypted_pdf"):
+            continue
+        r = PdfReader(disk_path(out / "input", e["file"]))
+        for info in e["page_info"]:
+            if info["content"] == "text":
+                continue
+            page = r.pages[info["index"] - 1]
+            mb = [float(x) for x in page.mediabox]
+            w, h = mb[2] - mb[0], mb[3] - mb[1]
+            m = re.search(rb"q\s+([\d.]+) 0 0 ([\d.]+) 0 0 cm", page.get_contents().get_data())
+            assert m, (e["file"], info["index"])
+            dw, dh = float(m.group(1)), float(m.group(2))
+            assert abs(dw - w) < 1 and abs(dh - h) < 1, ("이미지가 MediaBox 와 어긋남(잘림)", e["file"], info["index"], (dw, dh), (w, h))
+            ink = _ink_fraction(page.images[0].image)
+            if info["content"] == "image":
+                assert ink > 0.0004, ("글자 잉크가 거의 안 보임", e["file"], info["index"], ink)
+                if info["pdf_rotate"]:
+                    rot_seen += 1
+            else:
+                assert ink < 0.0002, ("빈 쪽에 잉크", e["file"], info["index"], ink)
+    assert rot_seen >= 1  # /Rotate 쪽이 코퍼스에 실제로 있고 검사되었다

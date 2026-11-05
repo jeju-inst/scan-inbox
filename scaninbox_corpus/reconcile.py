@@ -6,7 +6,10 @@
 대상 도구(OSS 조합 또는 자체 앱)가 남긴 실행 기록(ledger)을 정답 manifest 와 실제 폴더 상태에 대조한다.
 기록 형식은 schema/ledger.schema.json 을 따른다:
   {"entries": [{"input": "<입력 상대경로>", "status": "completed|held|failed",
-                "original_sha256": "...", "final_path": "<완료 폴더 상대경로>", "final_sha256": "...", "reason": "..."}]}
+                "original_sha256": "...", "final_path": "<완료 폴더 상대경로>", "final_sha256": "...", "reason": "...",
+                "approved_by_user": true}]}
+기대 결과가 review 인 파일(제목·날짜 불명 서식, 다중 문서 묶음)은 completed 로 기록하려면 사용자 승인
+(approved_by_user: true)이 있어야 하고, 기대 결과가 fail 인 파일(암호화·손상 PDF)은 completed 가 될 수 없다.
 ledger 에 없는 입력은 `미착수`로 센다. 위반이 하나라도 있으면 종료 코드 1.
 """
 from __future__ import annotations
@@ -18,7 +21,10 @@ import sys
 import unicodedata
 from pathlib import Path
 
+from .pathutil import extended
+
 STATUSES = ("completed", "held", "failed")
+_FAIL_KIND = {"encrypted_pdf": "암호화", "corrupt_pdf": "손상"}
 
 
 def _nfc(s: str) -> str:
@@ -89,12 +95,17 @@ def reconcile(manifest: dict, ledger: dict, input_dir: Path, done_dir: Path | No
             errors.append(f"[입력 미정리] {k}: 완료인데 입력 폴더에 그대로 남아 있음")
         if e.get("original_sha256") != registered[k]["sha256"]:
             errors.append(f"[원본 해시 불일치] {k}: 기록된 원본 해시가 manifest 와 다름")
+        # 기대 결과 위반은 최종본 기록 유무와 무관하게 먼저 잡는다(기록이 부족해도 위장은 위장이다).
+        reg = registered[k]
+        if reg["expected_outcome"] == "fail":
+            kind = _FAIL_KIND.get(reg.get("category"), "처리 불가")
+            errors.append(f"[실패 위장] {k}: {kind} PDF 는 실패로 남아야 하는데 완료로 기록됨")
+        elif reg["expected_outcome"] == "review" and e.get("approved_by_user") is not True:
+            errors.append(f"[검토 누락] {k}: 검토 대상({reg.get('category')})이 사용자 승인 기록(approved_by_user) 없이 자동 완료됨")
         fp, fh = e.get("final_path"), e.get("final_sha256")
         if not fp or not fh:
             errors.append(f"[완료 기록 부족] {k}: final_path·final_sha256 필요")
             continue
-        if registered[k]["expected_outcome"] == "fail":
-            errors.append(f"[실패 위장] {k}: 처리 불가여야 하는 파일이 완료로 기록됨")
         fkey = _nfc(fp)  # 중복 검출과 파일 조회에 같은 정규화 키를 쓴다
         if fkey in finals:
             errors.append(f"[최종본 경로 중복] {fp}: {finals[fkey]} 와 {k} 가 같은 최종 경로 사용(덮어쓰기)")
@@ -134,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     res = reconcile(json.loads(Path(a.manifest).read_text(encoding="utf-8")),
                     json.loads(Path(a.ledger).read_text(encoding="utf-8")),
-                    Path(a.input_dir), Path(a.done_dir) if a.done_dir else None)
+                    extended(a.input_dir), extended(a.done_dir) if a.done_dir else None)
     if a.json:
         print(json.dumps(res, ensure_ascii=False, indent=1))
     else:

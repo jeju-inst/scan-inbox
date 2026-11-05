@@ -16,6 +16,7 @@
           "original_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "final_path": { "type": "string", "description": "completed 일 때 완료 폴더 기준 상대경로" },
           "final_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "approved_by_user": { "type": "boolean", "description": "completed 일 때 사용자가 검토·승인했는가. 기대 결과가 review 인 파일은 true 가 아니면 위반" },
           "reason": { "type": "string", "description": "held·failed 일 때 필수" }
         }
       }

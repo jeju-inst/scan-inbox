@@ -8,13 +8,14 @@ from pathlib import Path
 import pytest
 
 from scaninbox_corpus import reconcile, snapshot
+from scaninbox_corpus.pathutil import extended
 
 
 @pytest.fixture()
 def work(corpus, tmp_path):
     """생성 코퍼스를 시험마다 새 복사본으로 쓴다."""
     out, manifest = corpus
-    root = tmp_path / "w"
+    root = extended(tmp_path / "w")
     shutil.copytree(out, root)
     return root, manifest
 
@@ -94,6 +95,45 @@ def test_reconcile_detects_silent_success_overwrite_and_missing_reason(work):
                                       {"input": "nope.pdf", "status": "failed", "reason": "x"}]}, root, done)
     joined = "\n".join(res["errors"])
     assert "사유 없음" in joined and "중복 기록" in joined and "미등록 입력" in joined
+
+
+def test_reconcile_flags_review_auto_completed_and_fail_disguised(work):
+    root, manifest = work
+    done = root / "done_preexisting"
+    by = {}
+    for e in manifest["files"]:
+        by.setdefault(e["category"], e["file"])
+    # 기대 review(제목 없는 서식·다중 문서 묶음)가 승인 기록 없이 완료되면 위반
+    for cat in ("untitled_form", "multi_doc_bundle"):
+        led = ledger_for(manifest, root, done, complete=[by[cat]])
+        errs = run(manifest, led, root, done)["errors"]
+        assert any("검토 누락" in x and by[cat] in x for x in errs), cat
+        # 사용자 승인 기록이 있으면 통과
+        led["entries"][0]["approved_by_user"] = True
+        assert not any("검토 누락" in x for x in run(manifest, led, root, done)["errors"])
+    # 암호화·손상 PDF 가 완료로 위장되면 위반(종류가 메시지에 드러난다)
+    for cat, kind in (("encrypted_pdf", "암호화"), ("corrupt_pdf", "손상")):
+        led = ledger_for(manifest, root, done, complete=[by[cat]])
+        errs = run(manifest, led, root, done)["errors"]
+        assert any("실패 위장" in x and kind in x for x in errs), cat
+    # 최종본 기록이 비어 있어도 위장은 잡힌다
+    led = {"entries": [{"input": by["encrypted_pdf"], "status": "completed",
+                        "original_sha256": next(e["sha256"] for e in manifest["files"] if e["file"] == by["encrypted_pdf"])}]}
+    errs = run(manifest, led, root, done)["errors"]
+    assert any("실패 위장" in x for x in errs) and any("완료 기록 부족" in x for x in errs)
+
+
+def test_reconcile_no_false_positive_for_review_held_and_fail_failed(work):
+    root, manifest = work
+    done = root / "done_preexisting"
+    by = {}
+    for e in manifest["files"]:
+        by.setdefault(e["category"], e["file"])
+    # 정상 경로(실패는 failed, 검토는 held)는 위반 없음
+    led = ledger_for(manifest, root, done, held=[by["untitled_form"], by["multi_doc_bundle"]],
+                     failed=[by["encrypted_pdf"], by["corrupt_pdf"]])
+    errs = run(manifest, led, root, done)["errors"]
+    assert not any(("검토 누락" in x or "실패 위장" in x) for x in errs)
 
 
 def test_snapshot_detects_changes(work):
@@ -177,3 +217,53 @@ def test_snapshot_detects_directory_symlink_changes(tmp_path):
     (d / "link").unlink()
     (d / "link").mkdir()  # 링크를 실제 빈 폴더로 교체
     assert not snapshot.is_clean(snapshot.compare(snap, snapshot.take(d)))
+
+
+def test_snapshot_normalizes_extended_prefix_in_symlink_target(tmp_path, monkeypatch):
+    """Windows 의 readlink 가 `\\\\?\\` 접두를 붙여 돌려줘도 일반 표기로 기록한다."""
+    from scaninbox_corpus import pathutil
+    assert pathutil.strip_extended_str("\\\\?\\C:\\a\\b") == "C:\\a\\b"
+    assert pathutil.strip_extended_str("\\\\?\\UNC\\srv\\share\\x") == "\\\\srv\\share\\x"
+    assert pathutil.strip_extended_str("C:\\a") == "C:\\a" and pathutil.strip_extended_str("/posix/a") == "/posix/a"
+    d = tmp_path / "in"
+    d.mkdir()
+    (d / "l").symlink_to(d, target_is_directory=True)
+    monkeypatch.setattr(snapshot.os, "readlink", lambda p: "\\\\?\\C:\\x\\y")
+    assert snapshot.take(d)["files"]["l"]["symlink"] == "C:\\x\\y"
+
+
+def test_extended_path_helpers():
+    from scaninbox_corpus import pathutil
+    assert pathutil.to_extended_str("C:\\a\\b") == "\\\\?\\C:\\a\\b"
+    assert pathutil.to_extended_str("\\\\srv\\share\\x") == "\\\\?\\UNC\\srv\\share\\x"
+    assert pathutil.to_extended_str("\\\\?\\C:\\a") == "\\\\?\\C:\\a"  # 이미 확장 경로면 그대로
+    assert pathutil.to_extended_str("C:\\a\\..\\b\\.\\c") == "\\\\?\\C:\\b\\c"  # `\\?\` 경로는 .. 를 해석하지 않으므로 미리 정규화
+    if __import__("os").name != "nt":  # 비 Windows 에서는 경로를 건드리지 않는다
+        assert str(pathutil.extended("/tmp/x")) == "/tmp/x"
+
+
+def test_font_license_not_misreported_as_ofl(tmp_path):
+    from scaninbox_corpus.fonts import FONT_LICENSE_OFL, font_info
+    f = tmp_path / "malgun.ttf"
+    f.write_bytes(b"x")
+    assert font_info(f)["license"] != FONT_LICENSE_OFL
+    g = tmp_path / "Custom.ttf"
+    g.write_bytes(b"x")
+    assert font_info(g)["license"] != FONT_LICENSE_OFL
+    n = tmp_path / "NanumBarunGothic.ttf"
+    n.write_bytes(b"x")
+    assert font_info(n)["license"] == FONT_LICENSE_OFL
+
+
+def test_font_candidates_cover_windows_and_prefer_ofl(monkeypatch):
+    from scaninbox_corpus import fonts
+    monkeypatch.setenv("WINDIR", "C:\\Windows")
+    monkeypatch.setenv("LOCALAPPDATA", "C:\\Users\\u\\AppData\\Local")
+    names = [str(p).replace("\\", "/") for p in fonts.candidates()]
+    assert any(n.endswith("Windows/Fonts/NanumBarunGothic.ttf") for n in names)
+    assert any("Microsoft/Windows/Fonts/NanumGothic.ttf" in n for n in names)
+    assert any(n.endswith("Windows/Fonts/malgun.ttf") for n in names)
+    # OFL 폰트 후보가 모두 시스템 폰트(맑은 고딕)보다 앞에 온다
+    last_ofl = max(i for i, n in enumerate(names) if not n.endswith("malgun.ttf"))
+    first_sys = min(i for i, n in enumerate(names) if n.endswith("malgun.ttf"))
+    assert last_ofl < first_sys

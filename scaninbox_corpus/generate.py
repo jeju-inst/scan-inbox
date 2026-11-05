@@ -32,6 +32,7 @@ from reportlab.lib.pdfencrypt import StandardEncryption
 
 from . import __version__, content
 from .fonts import find_font, font_info
+from .pathutil import extended
 from .layout import PAGE_H, PAGE_W, PDF_FONT_NAME, draw_vector, layout, render_raster
 from .scanfx import blank_scan, scan_effect
 
@@ -82,7 +83,9 @@ def build_pdf(pages: list[PageSpec], font: Path, dpi: int, rng: random.Random, *
                 img_bytes = scan_effect(raster, rng)
                 content_kind = "image"
             has_text = False
-            c.setPageSize((w_pt, h_pt))
+            # reportlab 은 /Rotate 가 90·270 이면 setPageSize 값을 '표시 크기'로 보고 MediaBox 를 가로세로
+            # 바꿔 쓴다. 그대로 두면 MediaBox 가 이미지와 어긋나 이미지가 잘리므로(내용이 안 보임) 미리 맞바꿔 넘긴다.
+            c.setPageSize((h_pt, w_pt) if ps.pdf_rotate in (90, 270) else (w_pt, h_pt))
             c.drawImage(ImageReader(io.BytesIO(img_bytes)), 0, 0, width=w_pt, height=h_pt)
         c.setPageRotation(ps.pdf_rotate)  # reportlab 은 값을 다음 쪽으로 이어가므로 항상 지정
         c.showPage()
@@ -224,7 +227,7 @@ def _sha256(data: bytes) -> str:
 
 
 def generate(out: Path, *, seed: int = DEFAULT_SEED, dpi: int = 150, font_path: str | None = None, force: bool = False) -> dict:
-    out = Path(out)
+    out = extended(out)  # Windows MAX_PATH 대응(그 외 OS 에서는 그대로)
     font = find_font(font_path)
     if out.exists() and any(out.iterdir()):
         if not force:
