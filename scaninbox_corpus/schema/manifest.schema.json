@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Scan Inbox 합성 코퍼스 정답 manifest",
+  "type": "object",
+  "required": ["schema_version", "synthetic", "generator", "font", "files", "preexisting", "skipped"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "synthetic": { "const": true, "description": "항상 true. 실문서가 섞이지 않았음을 명시한다." },
+    "generator": {
+      "type": "object",
+      "required": ["name", "version", "seed", "dpi", "pillow", "reportlab"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "seed": { "type": "integer" },
+        "dpi": { "type": "integer" },
+        "pillow": { "type": "string" },
+        "reportlab": { "type": "string" }
+      }
+    },
+    "font": {
+      "type": "object",
+      "description": "사용 폰트. 로컬 경로는 기록하지 않는다.",
+      "required": ["family", "file", "sha256", "license"],
+      "properties": {
+        "family": { "type": "string" },
+        "file": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "license": { "type": "string" }
+      }
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/file" }
+    },
+    "preexisting": {
+      "type": "array",
+      "description": "완료 폴더에 미리 있는 파일(이름 충돌 시험). 입력 등록 건수에 포함하지 않는다.",
+      "items": {
+        "type": "object",
+        "required": ["file", "sha256", "collides_with"],
+        "properties": {
+          "file": { "type": "string" },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "collides_with": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "description": "이 환경에서 만들 수 없어 생략한 케이스와 이유",
+      "items": {
+        "type": "object",
+        "required": ["case", "reason"],
+        "properties": { "case": { "type": "string" }, "reason": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "file": {
+      "type": "object",
+      "required": ["file", "category", "expected_title", "expected_type", "expected_date", "expected_lang",
+                   "expected_outcome", "pages", "sha256", "size", "page_info", "notes"],
+      "additionalProperties": false,
+      "properties": {
+        "file": { "type": "string", "description": "input/ 기준 상대 경로. 구분자 '/', 유니코드 NFC." },
+        "category": {
+          "enum": ["titled_scan_ko", "untitled_form", "english_scan", "mixed_lang_scan", "text_layer_pdf",
+                   "mixed_pdf", "rotated_blank", "multi_doc_bundle", "name_collision", "corrupt_pdf", "encrypted_pdf"]
+        },
+        "expected_title": { "type": ["string", "null"], "description": "본문에 인쇄된 제목. 제목 없음·묶음·손상은 null." },
+        "expected_type": { "type": "string", "description": "기대 문서 유형 라벨" },
+        "expected_date": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "description": "문서에 인쇄된 날짜. 없거나 애매하면 null(지어내면 안 됨)." },
+        "expected_lang": { "enum": ["ko", "en", "ko+en"] },
+        "expected_outcome": {
+          "enum": ["complete", "review", "fail"],
+          "description": "complete=정상 완료 가능, review=검토(보류) 대상이어야 함, fail=처리 불가로 입력에 남아야 함"
+        },
+        "pages": { "type": "integer", "minimum": 1, "description": "기대 페이지 수(OCR 후에도 보존). 손상 파일은 원본 페이지 수." },
+        "sha256": { "$ref": "#/$defs/sha256", "description": "입력 파일 바이트의 SHA-256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "page_info": {
+          "type": "array",
+          "description": "페이지별 정보. 손상 PDF 는 빈 배열.",
+          "items": {
+            "type": "object",
+            "required": ["index", "content", "has_text_layer", "ocr_needed", "physical_rotation", "pdf_rotate"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 1 },
+              "content": { "enum": ["text", "image", "blank"] },
+              "has_text_layer": { "type": "boolean" },
+              "ocr_needed": { "type": "boolean" },
+              "physical_rotation": { "enum": [0, 90, 180, 270], "description": "이미지 자체가 회전된 각도" },
+              "pdf_rotate": { "enum": [0, 90, 180, 270], "description": "PDF 쪽 /Rotate 속성" }
+            }
+          }
+        },
+        "documents": {
+          "type": "array",
+          "description": "다중 문서 묶음의 문서별 정답",
+          "items": {
+            "type": "object",
+            "required": ["title", "type", "date", "page_start", "page_end"],
+            "properties": {
+              "title": { "type": ["string", "null"] },
+              "type": { "type": "string" },
+              "date": { "type": ["string", "null"] },
+              "page_start": { "type": "integer" },
+              "page_end": { "type": "integer" }
+            }
+          }
+        },
+        "collision": {
+          "type": "object",
+          "required": ["kind", "group"],
+          "properties": {
+            "kind": { "enum": ["same_title", "same_filename_other_dir", "preexisting_target", "nfd_nfc", "long_path", "case_only"] },
+            "group": { "type": "string" }
+          }
+        },
+        "name_normalization": { "enum": ["NFD"], "description": "디스크 상 파일명이 NFD 로 만들어졌음" },
+        "pages_readable": { "const": false },
+        "encrypted": { "const": true },
+        "notes": { "type": "string" }
+      }
+    }
+  }
+}

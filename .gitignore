@@ -21,4 +21,7 @@ scan_처리완료/
 originals/
 __pycache__/
 .venv/
+corpus_out/
+*.egg-info/
+.pytest_cache/
 .DS_Store
