@@ -1,0 +1,24 @@
+# Private runtime state and document inputs
+.env
+.env.*
+!.env.example
+config.local.*
+*.pdf
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.png
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.log
+private/
+local-data/
+scan/
+scan_처리완료/
+originals/
+__pycache__/
+.venv/
+.DS_Store
