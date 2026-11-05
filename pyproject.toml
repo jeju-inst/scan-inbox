@@ -14,8 +14,10 @@ dependencies = [
   "pillow==13.0.0",
   "reportlab==5.1.0",
   "pypdf==6.21.4",
+  # OCR 엔진. Python 3.12, macOS arm64·Windows x64 에서 검증(2026-11-05), Ghostscript 불필요.
+  # Tesseract 5.x 와 kor.traineddata(tessdata_fast 4.1.0)는 파이썬 패키지가 아니라 설치 단계 안내 대상이다.
+  "ocrmypdf==17.13.0",
 ]
-# G1 구현 의존성(ocrmypdf 등)은 해당 트랙 PR 에서 검증한 버전으로 추가한다.
 
 [project.optional-dependencies]
 dev = [
