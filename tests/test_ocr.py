@@ -323,6 +323,25 @@ def test_retry_not_adopted_when_not_better(fake_env, tmp_path, monkeypatch):
     assert len(list((tp / "out").glob("*.pdf"))) == 1
 
 
+def test_cancel_during_retry_propagates_and_cleans_up(fake_env, tmp_path, monkeypatch):
+    import scaninbox.ocr as ocr_mod
+    eng, tp = fake_env
+    ev = threading.Event()
+    monkeypatch.setattr(ocr_mod, "suspect_pages", lambda texts: [1])  # 첫 결과가 의심 쪽을 가져 재시도로 간다
+    real = OcrmypdfEngine._run_once
+
+    def run_once(self, src, dst_dir, langs, pages_in, engine, threshold, timeout_s, cancel):
+        if threshold == 0.5:  # 재시도 시작 시점에 취소가 걸린 상황
+            ev.set()
+            return ocr_mod.OcrResult(OcrStatus.FAILED, page_count_in=pages_in, engine=engine, reason="취소됨")
+        return real(self, src, dst_dir, langs, pages_in, engine, threshold, timeout_s, cancel)
+
+    monkeypatch.setattr(OcrmypdfEngine, "_run_once", run_once)
+    res = eng.run(_image_only_pdf(tp / "in.pdf", pages=2), tp / "out", cancel=ev)
+    assert res.status is OcrStatus.FAILED and res.reason == "취소됨" and res.output is None
+    assert not list((tp / "out").glob("*.pdf"))
+
+
 def test_no_retry_without_suspect_or_when_disabled(fake_env, tmp_path, monkeypatch):
     import scaninbox.ocr as ocr_mod
     eng, tp = fake_env

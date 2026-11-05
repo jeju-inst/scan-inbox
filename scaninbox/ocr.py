@@ -405,6 +405,11 @@ class OcrmypdfEngine:
             if remaining < 5 or best.status not in (OcrStatus.OK, OcrStatus.PARTIAL) or not _has_suspect(best):
                 break
             alt = self._run_once(src, dst_dir, langs, pages_in, engine, thr, int(remaining), cancel)
+            if cancel is not None and cancel.is_set():
+                # 재시도 중 취소: 앞선 결과로 되돌아가지 않고 취소를 그대로 전달한다(보관 중이던 출력은 정리).
+                self._discard(best.output)
+                self._discard(alt.output)
+                return OcrResult(OcrStatus.FAILED, page_count_in=pages_in, engine=alt.engine, reason="취소됨")
             if alt.output is not None and _problem_pages(alt) < _problem_pages(best):
                 self._discard(best.output)
                 alt.reason = (alt.reason + "; " if alt.reason else "") + f"회전 임계값 {thr} 로 재실행한 결과를 채택"

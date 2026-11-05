@@ -197,6 +197,11 @@ def test_short_first_line_with_second_candidate_is_ambiguous():
     assert "가상기관" in p.evidence_snippet
 
 
+def test_english_org_header_is_not_joined_with_title_line():
+    p = EX.propose(None, ["Example Facilities Office\nAnnual Report\nMarch 5, 2026\nThis document is fictional."])
+    assert p.title == "Annual Report" and not p.review_reasons
+
+
 def test_multi_document_suspected_when_pages_have_different_titles():
     p = EX.propose(None, ["업무 협조 요청서\n2026. 3. 5.\n내용: 가상", "현장 방문 결과 보고\n2026. 3. 9.\n내용: 가상"])
     assert p.title is None and p.doc_date is None

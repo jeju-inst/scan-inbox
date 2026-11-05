@@ -204,7 +204,8 @@ def _candidates(lines: list[str], *, first_page: bool) -> tuple[list[tuple[int, 
         # 제목이 두 줄로 나뉜 경우(짧은 라틴 단어 한 줄이 이어짐)
         if i + 1 < len(lines):
             nxt = lines[i + 1]
-            if (len(nxt.split()) <= 2 and re.fullmatch(r"[A-Za-z][A-Za-z\- ]*", nxt)
+            if (not (i == 0 and _org_like(cand))  # 첫 줄 기관명에 제목을 이어 붙이지 않는다
+                    and len(nxt.split()) <= 2 and re.fullmatch(r"[A-Za-z][A-Za-z\- ]*", nxt)
                     and not _SENTENCE_END_RE.search(cand) and not _is_meta_line(nxt)
                     and re.search(r"[A-Za-z]{3,}$", cand)):
                 cand, used = f"{cand} {nxt}", 2
