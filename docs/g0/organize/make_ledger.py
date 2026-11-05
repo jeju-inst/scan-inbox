@@ -52,8 +52,12 @@ def main() -> int:
                                 "final_path": dp.relative_to(run / "done").as_posix(), "final_sha256": sha(dp)})
             else:
                 entries.append({"input": rel, "status": "held", "reason": "제목 규칙 불일치(review 폴더로 이동)"})
-        else:
+        elif (run / "work" / f"{h}.pdf").exists():
+            continue  # OCR 사본은 있으나 2단계가 처리하지 않음: ledger 에 넣지 않아 '미착수'로 센다
+        elif (run / "originals" / f"{h}.pdf").exists():
+            # 1단계가 시도했으나(백업은 cp 로 먼저 만들어짐) OCR 사본이 없음 = 실제 OCR 실패 증거
             entries.append({"input": rel, "status": "failed", "reason": "OCR 사본 없음(ocrmypdf 오류)"})
+        # 둘 다 없으면 1단계도 시작 전: 미착수
     if a.cleanup_input:
         for e in entries:
             if e["status"] != "completed":

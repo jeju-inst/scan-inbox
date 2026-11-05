@@ -8,6 +8,7 @@ review_missed=검토 대상(제목 없음·묶음)인데 자동 완료됨.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import unicodedata
 from pathlib import Path
@@ -32,8 +33,8 @@ def main() -> int:
                 verdict = "fail_masked"
             elif e["expected_title"] and n(stem) == n(e["expected_title"]):
                 verdict = "exact"
-            elif e["expected_title"] and n(stem).startswith(n(e["expected_title"])):
-                verdict = "exact"  # 충돌 접미사(" 2")만 붙은 경우
+            elif e["expected_title"] and re.fullmatch(re.escape(n(e["expected_title"])) + r"\d+", n(stem)):
+                verdict = "exact"  # 충돌 숫자 접미사(" 2")만 붙은 경우. 임의 문자열이 붙으면 wrong
             else:
                 verdict = "wrong"
             print(f"{verdict:14s} {e['category']:18s} 기대={e['expected_title']!r} 결과={stem!r}")
