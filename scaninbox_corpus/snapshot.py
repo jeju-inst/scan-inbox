@@ -38,8 +38,12 @@ def take(root: Path) -> dict:
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dp = Path(dirpath)
         for d in sorted(dirnames):
-            rel = (dp / d).relative_to(root).as_posix()
-            dirs.append(rel)
+            p = dp / d
+            rel = p.relative_to(root).as_posix()
+            if p.is_symlink():  # 폴더를 가리키는 링크: 따라가지 않고 대상 문자열만 기록
+                files[rel] = {"symlink": os.readlink(p), "dir_link": True}
+            else:
+                dirs.append(rel)
         for fn in sorted(filenames):
             p = dp / fn
             rel = p.relative_to(root).as_posix()

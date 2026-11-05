@@ -95,22 +95,24 @@ def reconcile(manifest: dict, ledger: dict, input_dir: Path, done_dir: Path | No
             continue
         if registered[k]["expected_outcome"] == "fail":
             errors.append(f"[실패 위장] {k}: 처리 불가여야 하는 파일이 완료로 기록됨")
-        if fp in finals:
-            errors.append(f"[최종본 경로 중복] {fp}: {finals[fp]} 와 {k} 가 같은 최종 경로 사용(덮어쓰기)")
-        finals[fp] = k
+        fkey = _nfc(fp)  # 중복 검출과 파일 조회에 같은 정규화 키를 쓴다
+        if fkey in finals:
+            errors.append(f"[최종본 경로 중복] {fp}: {finals[fkey]} 와 {k} 가 같은 최종 경로 사용(덮어쓰기)")
+        finals[fkey] = k
         if done_dir is not None:
-            p = done_idx.get(_nfc(fp))
+            p = done_idx.get(fkey)
             if p is None:
                 errors.append(f"[최종본 없음] {k}: {fp} 가 완료 폴더에 없음")
             elif _sha256(p) != fh:
                 errors.append(f"[최종본 해시 불일치] {k}: {fp}")
-            if Path(fp).name in pre_hash and p is not None and _sha256(p) != pre_hash[Path(fp).name]:
-                errors.append(f"[기존 파일 덮어쓰기] {fp}: 완료 폴더에 미리 있던 파일이 바뀜")
     if done_dir is not None:
+        # 완료 폴더에 미리 있던 파일은 ledger 가 언급하는지와 무관하게 항상 원본 해시를 유지해야 한다
         for name, h in pre_hash.items():
-            hits = [p for kk, p in done_idx.items() if Path(kk).name == _nfc(name)]
-            if not hits and not any(Path(fp).name == _nfc(name) for fp in finals):
+            p = done_idx.get(_nfc(name))
+            if p is None:
                 errors.append(f"[기존 파일 소실] {name}: 완료 폴더에 미리 있던 파일이 사라짐")
+            elif _sha256(p) != h:
+                errors.append(f"[기존 파일 덮어쓰기] {name}: 완료 폴더에 미리 있던 파일 내용이 바뀜")
     for s in ("held", "failed"):
         for k in groups[s]:
             present_intact(k)

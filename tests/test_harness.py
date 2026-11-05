@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -130,3 +131,49 @@ def test_reconcile_cli(work, tmp_path):
     led.write_text(json.dumps({"entries": []}), encoding="utf-8")
     argv = ["--manifest", str(root / "manifest.json"), "--ledger", str(led), "--input-dir", str(root / "input")]
     assert reconcile.main(argv) == 0  # 전부 미착수, 입력 무변경
+
+
+def test_reconcile_detects_unrecorded_preexisting_overwrite(work):
+    root, manifest = work
+    done = root / "done_preexisting"
+    pre_name = Path(manifest["preexisting"][0]["file"]).name
+    (done / pre_name).write_bytes(b"overwritten without ledger entry")
+    res = run(manifest, {"entries": []}, root, done)
+    assert any("기존 파일 덮어쓰기" in e for e in res["errors"])
+    (done / pre_name).unlink()
+    assert any("기존 파일 소실" in e for e in run(manifest, {"entries": []}, root, done)["errors"])
+
+
+def test_reconcile_detects_nfc_nfd_final_path_collision(work):
+    root, manifest = work
+    done = root / "done_preexisting"
+    a, b = manifest["files"][0], manifest["files"][1]
+    # 같은 최종 파일을 NFC/NFD 두 철자로 가리키는 두 완료 기록
+    final_nfc = "최종/한글 결과.pdf"
+    final_nfd = unicodedata.normalize("NFD", final_nfc)
+    (done / "최종").mkdir()
+    (done / final_nfc).write_bytes(b"one output")
+    h = hashlib.sha256(b"one output").hexdigest()
+    for ent in (a, b):
+        (root / "input" / ent["file"]).unlink()
+    led = {"entries": [
+        {"input": a["file"], "status": "completed", "original_sha256": a["sha256"], "final_path": final_nfc, "final_sha256": h},
+        {"input": b["file"], "status": "completed", "original_sha256": b["sha256"], "final_path": final_nfd, "final_sha256": h},
+    ]}
+    assert any("최종본 경로 중복" in e for e in run(manifest, led, root, done)["errors"])
+
+
+def test_snapshot_detects_directory_symlink_changes(tmp_path):
+    d = tmp_path / "in"
+    (d / "a").mkdir(parents=True)
+    (d / "b").mkdir()
+    (d / "link").symlink_to(d / "a", target_is_directory=True)
+    snap = snapshot.take(d)
+    assert snap["files"]["link"]["symlink"] == str(d / "a")
+    assert snapshot.is_clean(snapshot.compare(snap, snapshot.take(d)))
+    (d / "link").unlink()
+    (d / "link").symlink_to(d / "b", target_is_directory=True)  # 다른 폴더로 재지정
+    assert snapshot.compare(snap, snapshot.take(d))["modified"] == ["link"]
+    (d / "link").unlink()
+    (d / "link").mkdir()  # 링크를 실제 빈 폴더로 교체
+    assert not snapshot.is_clean(snapshot.compare(snap, snapshot.take(d)))
