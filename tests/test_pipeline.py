@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import unicodedata
 from pathlib import Path
@@ -20,7 +21,7 @@ from scaninbox.contracts import (
     TitleExtractor,
     TitleProposal,
 )
-from scaninbox.journal import Journal, LockHeld, sha256_file
+from scaninbox.journal import Journal, LockHeld, LockLost, sha256_file
 from scaninbox.ocr import OcrmypdfEngine
 from scaninbox.pipeline import Pipeline
 from scaninbox.title import RuleTitleExtractor
@@ -1136,6 +1137,158 @@ def test_pipeline_evidence_snippet_not_in_journal(tmp_path):
     assert "발췌" not in rec.plan_json
     p_data = json.loads(rec.plan_json)
     assert "evidence_snippet" not in p_data
+
+
+def test_pipeline_stable_unreadable_pdf_reaches_ocr_classification(tmp_path):
+    """[Codex 지적 1] 안정화된 unreadable/손상/암호화 PDF 가 WAITING_STABLE 에 영구 고착되지 않고 OCR 분류(HELD/FAILED)에 도달함을 검증."""
+    import time
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    # ENCRYPTED 상태를 돌려주는 엔진
+    engine = FakeOcrEngine(default_status=OcrStatus.ENCRYPTED)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+    pipe.config.stable_seconds = 2
+
+    # PdfReader 가 파싱 실패하는 암호화/손상 의심 바이트
+    bad_pdf = in_dir / "encrypted.pdf"
+    bad_pdf.write_bytes(b"%PDF-corrupted-or-encrypted-content")
+
+    # 1차 scan: 작성 직후이므로 WAITING_STABLE 로 등록되고 대기
+    items1 = pipe.scan()
+    assert len(items1) == 0
+    rec1 = pipe._find_latest_record("encrypted.pdf")
+    assert rec1.state == State.WAITING_STABLE
+
+    # 파일의 mtime 을 10초 전으로 조작 (안정화 완료 시뮬레이션)
+    old_time = time.time() - 10
+    os.utime(bad_pdf, (old_time, old_time))
+    # 저널에 기록된 mtime 도 일치시켜 변동 없이 멈춰있는 상태로 맞춤
+    pipe.journal.transition(rec1.id, State.DISCOVERED, reason="시간 조작 리셋")
+    st_old = bad_pdf.stat()
+    pipe.journal.transition(
+        rec1.id, State.WAITING_STABLE, size=st_old.st_size, mtime_ns=st_old.st_mtime_ns, reason="안정화 대기 등록"
+    )
+
+    # 2차 scan: 안정화 시간 경과 확인 후 BACKED_UP 및 OCR 분류로 진행 -> HELD 로 전이
+    items2 = pipe.scan()
+    assert len(items2) == 0  # HELD 는 제안 목록에 없음
+    rec2 = pipe._find_latest_record("encrypted.pdf")
+    assert rec2.state == State.HELD
+    # 백업도 정상 생성되어 보존되었는지 확인
+    assert rec2.backup_rel is not None
+    assert (backup_dir / rec2.backup_rel).exists()
+
+
+def test_pipeline_discovered_metadata_change_refreshes_and_progresses(tmp_path):
+    """[Codex 지적 2] 기등록 파일의 mtime/size 변경 시 메타데이터가 갱신되어 무한 대기 없이 안정화 후 정상 진행됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+    pipe.config.stable_seconds = 0
+
+    doc = make_pdf(in_dir / "touched.pdf", "내용")
+    # 저널에 최초 DISCOVERED 로 등록
+    pipe.scan()
+    rec_init = pipe._find_latest_record("touched.pdf")
+
+    # 내용 변경 없이 mtime 만 터치 (100초 뒤로)
+    st = doc.stat()
+    os.utime(doc, (st.st_atime + 100, st.st_mtime + 100))
+
+    # scan 실행 시 mtime 변동이 감지되어 메타데이터가 갱신되고, stable_seconds=0 이므로 정상 진행
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "touched.pdf"
+
+
+def test_pipeline_shared_hash_records_preserve_ocr_artifacts(tmp_path):
+    """[Codex 지적 3] 동일 해시를 공유하는 두 개의 파일이 있을 때 첫 번째 apply 후에도 두 번째 파일의 OCR 산출물이 보존됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.OK)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    f1 = in_dir / "doc1.pdf"
+    f2 = in_dir / "doc2.pdf"
+    make_pdf(f1, "동일 내용 문서")
+    shutil.copy2(f1, f2)
+
+    items = pipe.scan()
+    assert len(items) == 2
+
+    # f1 먼저 승인 및 apply
+    pipe.approve("doc1.pdf")
+    res1 = pipe.apply(targets=["doc1.pdf"], force_review=True)
+    assert res1.applied == ["doc1.pdf"]
+
+    # f2 승인 및 apply: f1 의 완료로 인해 f2 의 OCR 산출물이 삭제되지 않고 정상 완료되어야 함
+    pipe.approve("doc2.pdf")
+    res2 = pipe.apply(targets=["doc2.pdf"], force_review=True)
+    assert res2.applied == ["doc2.pdf"]
+    assert len(res2.failed) == 0
+
+
+def test_pipeline_scan_aborts_on_lock_lost(tmp_path):
+    """[Codex 지적 4] 스캔 중 LockLost 발생 시 삼키지 않고 즉시 중단됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    class LockStealingEngine:
+        def __init__(self, journal_path):
+            self.j_path = journal_path
+
+        def run(self, src, dst, **kw):
+            import sqlite3
+            # 임대 만료 후 외부 프로세스가 락을 훔쳐간 상황 시뮬레이션
+            conn = sqlite3.connect(self.j_path)
+            conn.execute("UPDATE run_lock SET owner='thief', expires_at=9999999999.0 WHERE id=1")
+            conn.commit()
+            conn.close()
+            return OcrResult(status=OcrStatus.OK)
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=LockStealingEngine(j_path),
+    )
+
+    make_pdf(in_dir / "test.pdf")
+
+    with pytest.raises(LockLost):
+        pipe.scan()
+
 
 
 

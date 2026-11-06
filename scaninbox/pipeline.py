@@ -165,6 +165,7 @@ class Pipeline:
                         log.warning("루트 밖 탈출 경로 무시: %s (%s)", rel, e)
                         continue
 
+                    self.journal.renew_lock()
                     sha256 = sha256_file(path)
                     st = path.stat()
 
@@ -207,40 +208,59 @@ class Pipeline:
                         is_valid_pdf = False
                         log.debug("PDF 파싱 불완전: %s (%s)", rel, err)
 
-                    if not is_valid_pdf:
-                        log.info("[%s] PDF 파싱 불완전(작성/복사 중 의심), 안정화 대기", rel)
-                        if rec.state == State.DISCOVERED:
-                            self.journal.transition(
-                                rec.id, State.WAITING_STABLE, reason="PDF 파싱 대기(작성 중)"
-                            )
-                        continue
+                    now_s = time.time()
+                    time_since_mod = now_s - st.st_mtime
 
                     # 이미 WAITING_STABLE 인 경우 안정화 시간 및 변동 확인
                     if rec.state == State.WAITING_STABLE:
-                        now_s = time.time()
                         if (st.st_size != rec.size) or (st.st_mtime_ns != rec.mtime_ns):
-                            log.info("[%s] 파일 크기/수정시각 변동 중, 안정화 대기", rel)
+                            log.info("[%s] 파일 크기/수정시각 변동 중, 안정화 타이머 리셋", rel)
+                            # 메타데이터를 갱신하기 위해 DISCOVERED 거쳐 새 메타데이터로 WAITING_STABLE 전이
+                            rec = self.journal.transition(
+                                rec.id, State.DISCOVERED, reason="메타데이터 변동으로 안정화 리셋"
+                            )
+                            rec = self.journal.transition(
+                                rec.id, State.WAITING_STABLE, size=st.st_size, mtime_ns=st.st_mtime_ns, reason="변동 후 대기"
+                            )
                             continue
-                        time_since_rec = now_s - rec.updated_at
-                        if time_since_rec < self.config.stable_seconds:
+                        if time_since_mod < self.config.stable_seconds:
                             log.info(
                                 "[%s] 파일 안정화 대기 중 (%0.1fs < %ds)",
                                 rel,
-                                time_since_rec,
+                                time_since_mod,
                                 self.config.stable_seconds,
                             )
                             continue
+                        # 안정화 시간 경과: PDF 파싱 성공했거나, unreadable(암호화/손상)이어도 안정화되었으므로 OCR 사전점검으로 진행!
 
-                    # 이미 등록된 DISCOVERED 레코드인데 크기나 mtime이 변경된 경우 안정화 대기
-                    if rec.state == State.DISCOVERED and (
+                    elif not is_valid_pdf:
+                        # 최초 발견 또는 DISCOVERED 상태에서 PDF 파싱 실패 -> 메타데이터와 함께 WAITING_STABLE 전이
+                        log.info("[%s] PDF 파싱 불완전(작성/복사 중 의심), 안정화 대기", rel)
+                        if rec.state == State.DISCOVERED:
+                            rec = self.journal.transition(
+                                rec.id,
+                                State.WAITING_STABLE,
+                                size=st.st_size,
+                                mtime_ns=st.st_mtime_ns,
+                                reason="PDF 파싱 대기(작성 중)",
+                            )
+                        continue
+
+                    # 이미 등록된 DISCOVERED 레코드인데 크기나 mtime이 변경된 경우 안정화 대기 (새 메타데이터 기록)
+                    elif rec.state == State.DISCOVERED and (
                         (rec.size is not None and st.st_size != rec.size)
                         or (rec.mtime_ns is not None and st.st_mtime_ns != rec.mtime_ns)
                     ):
                         log.info("[%s] 파일 크기/수정시각 변경 감지, 안정화 대기", rel)
-                        self.journal.transition(
-                            rec.id, State.WAITING_STABLE, reason="파일 크기/수정시각 변동 대기"
+                        rec = self.journal.transition(
+                            rec.id,
+                            State.WAITING_STABLE,
+                            size=st.st_size,
+                            mtime_ns=st.st_mtime_ns,
+                            reason="파일 크기/수정시각 변동 대기",
                         )
-                        continue
+                        if self.config.stable_seconds > 0 and time_since_mod < self.config.stable_seconds:
+                            continue
 
                     # 이전 스캔 중 EXTRACTED 전이 후 REVIEW_PENDING 전에 중단된 경우,
                     # 허용 전이(EXTRACTED -> DISCOVERED)로 리셋하여 안전하게 보호 및 재추출을 수행한다.
@@ -332,9 +352,12 @@ class Pipeline:
                         )
                         continue
 
-                    tmp_ocr = self.work_dir / f"ocr_{sha256[:12]}"
+                    # 레코드별 고유 임시 디렉터리 (동일 해시 다른 파일의 산출물 충돌/조기 삭제 방지)
+                    tmp_ocr = self.work_dir / f"ocr_{rec.id}_{sha256[:12]}"
                     tmp_ocr.mkdir(parents=True, exist_ok=True)
+                    self.journal.renew_lock()
                     ocr_res = self.ocr_engine.run(bk_target, tmp_ocr, langs=self.langs)
+                    self.journal.renew_lock()
 
                     if ocr_res.status == OcrStatus.ENCRYPTED:
                         self.journal.transition(
@@ -409,6 +432,9 @@ class Pipeline:
                         warnings=list(title_prop.review_reasons),
                     )
                     plan_items.append(item)
+                except LockLost:
+                    log.error("스캔 중 작업 임대 소실(다른 프로세스가 잠금 획득), 스캔 즉시 중단")
+                    raise
                 except Exception as ex:
                     log.exception("파일 스캔 중 오류 발생: %s (%s)", path, ex)
                     continue
@@ -675,10 +701,18 @@ class Pipeline:
                         rec.id, State.COMPLETED, approved_by_user=True
                     )
 
-                    # 10. OCR 임시 디렉터리 정리
-                    tmp_ocr = self.work_dir / f"ocr_{rec.original_sha256[:12]}"
+                    # 10. OCR 임시 디렉터리 정리 (해당 레코드 전용 디렉터리만 정리하여 동일 해시 타 레코드 산출물 보존)
+                    tmp_ocr = self.work_dir / f"ocr_{rec.id}_{rec.original_sha256[:12]}"
                     if tmp_ocr.exists():
                         shutil.rmtree(tmp_ocr, ignore_errors=True)
+                    legacy_ocr = self.work_dir / f"ocr_{rec.original_sha256[:12]}"
+                    if legacy_ocr.exists():
+                        other_refs = [
+                            r for r in self.journal.list()
+                            if r.id != rec.id and r.original_sha256 == rec.original_sha256 and r.state not in (State.COMPLETED, State.FAILED)
+                        ]
+                        if not other_refs:
+                            shutil.rmtree(legacy_ocr, ignore_errors=True)
 
                     applied.append(rec.input_rel)
                 except Exception as ex:
