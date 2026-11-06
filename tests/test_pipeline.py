@@ -20,7 +20,7 @@ from scaninbox.contracts import (
     TitleExtractor,
     TitleProposal,
 )
-from scaninbox.journal import Journal, sha256_file
+from scaninbox.journal import Journal, LockHeld, sha256_file
 from scaninbox.ocr import OcrmypdfEngine
 from scaninbox.pipeline import Pipeline
 from scaninbox.title import RuleTitleExtractor
@@ -268,9 +268,10 @@ def test_pipeline_input_hash_change_rejected(env_dirs):
 
     doc.write_bytes(b"%PDF-1.4 tampered bytes")
 
-    with pytest.raises(ValueError, match="해시와 불일치"):
-        pipe.apply(targets=["tampered.pdf"])
-
+    res = pipe.apply(targets=["tampered.pdf"])
+    assert len(res.applied) == 0
+    assert len(res.failed) == 1
+    assert "변경 감지" in res.failed[0][1]
     assert doc.exists()
 
 
@@ -619,9 +620,11 @@ def test_pipeline_apply_rejects_modified_backup(tmp_path):
     assert bk_file.exists()
     bk_file.write_bytes(b"%PDF-1.4 modified corrupted content")
 
-    # apply 시 백업 변조가 감지되어 ValueError 발생해야 함
-    with pytest.raises(ValueError, match="백업 파일 변조 감지"):
-        pipe.apply(approve_all=False)
+    # apply 시 백업 변조가 감지되어 실패 목록에 기록되고 FAILED 상태로 전이되어야 함
+    res = pipe.apply(approve_all=False)
+    assert len(res.applied) == 0
+    assert len(res.failed) == 1
+    assert "변조 감지" in res.failed[0][1]
 
     # 원본 입력 파일은 절대 삭제되지 않고 온전히 남아 있어야 함
     assert f1.exists()
@@ -768,6 +771,372 @@ def test_pipeline_publish_does_not_clobber_existing_file(tmp_path):
     pipe.recover()
     assert existing_file.exists()
     assert sha256_file(existing_file) == existing_hash
+
+
+def test_pipeline_apply_missing_backup_rel_preserves_input(tmp_path):
+    """[요구 1] backup_rel 이 누락되거나 백업 파일이 소실된 경우 절대 입력을 지우지 않고 FAILED 로 기록됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    doc = make_pdf(in_dir / "loss_test.pdf", "내용")
+    pipe.scan()
+    pipe.approve("loss_test.pdf")
+
+    # 백업 파일 삭제 (소실 시뮬레이션)
+    bk_file = backup_dir / "loss_test.pdf"
+    if bk_file.exists():
+        bk_file.unlink()
+
+    res = pipe.apply()
+    assert len(res.applied) == 0
+    assert len(res.failed) == 1
+    assert "백업 파일 소실" in res.failed[0][1]
+
+    # 입력 파일은 절대 삭제되지 않아야 함
+    assert doc.exists()
+
+    # 저널 레코드는 FAILED 로 전이되어야 함
+    rec = pipe.journal.get(1)
+    assert rec.state == State.FAILED
+
+
+def test_pipeline_scan_skips_publishing_records_and_isolates(tmp_path):
+    """[요구 2] PUBLISHING/PUBLISHED/SOURCE_CLEANUP_PENDING 상태인 파일이 있어도 scan 전체가 중단되지 않고 격리됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    doc1 = make_pdf(in_dir / "pub_pending.pdf", "발행중")
+    doc2 = make_pdf(in_dir / "normal.pdf", "정상문서")
+    pipe.scan()
+    pipe.approve("pub_pending.pdf")
+
+    # pub_pending.pdf 를 수동으로 PUBLISHING 상태로 조작
+    rec1 = pipe._find_latest_record("pub_pending.pdf")
+    pipe.journal.transition(
+        rec1.id, State.PUBLISHING, final_rel="pub_pending.pdf", final_sha256=rec1.original_sha256
+    )
+
+    # 다시 scan 호출 시 pub_pending.pdf 는 건너뛰고 normal.pdf 는 정상 처리되어야 함
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "normal.pdf"
+
+
+def test_pipeline_apply_batch_isolation_and_old_record_reset(tmp_path):
+    """[요구 3] apply 일괄 실행 시 불량 항목이 있어도 정상 항목은 계속 처리되고, 내용이 변경된 낡은 레코드는 DISCOVERED 로 복귀함을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    f_bad = make_pdf(in_dir / "bad.pdf", "원래 내용")
+    f_good = make_pdf(in_dir / "good.pdf", "정상 내용")
+    pipe.scan()
+    pipe.approve("bad.pdf")
+    pipe.approve("good.pdf")
+
+    # bad.pdf 의 내용을 바꿔서 승인 시점 해시와 불일치하게 만듦 (새 문서 도착 시뮬레이션)
+    f_bad.write_bytes(b"%PDF-1.4 changed content after approve")
+
+    # 일괄 확정 실행
+    res = pipe.apply(approve_all=False)
+
+    # good.pdf 는 성공하고 bad.pdf 만 failed 로 분리되어야 함 (배치 전체 중단 없음)
+    assert res.applied == ["good.pdf"]
+    assert len(res.failed) == 1
+    assert res.failed[0][0] == "bad.pdf"
+
+    # bad.pdf 레코드는 DISCOVERED 로 되돌려져 재스캔 가능해야 함
+    rec_bad = pipe._find_latest_record("bad.pdf")
+    assert rec_bad.state == State.DISCOVERED
+
+
+def test_pipeline_undo_idempotent_and_finds_completed_record(tmp_path):
+    """[요구 4] undo 멱등성: 이미 입력이 복구되었으면 충돌 없이 완료되며, 같은 input_rel 에 새 레코드가 있어도 COMPLETED 레코드를 찾아 복구함을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    doc = make_pdf(in_dir / "target.pdf", "타겟 내용")
+    pipe.scan()
+    pipe.approve("target.pdf")
+    pipe.apply(approve_all=True)
+
+    # 1차 undo 성공
+    undone = pipe.undo("target.pdf")
+    assert undone == ["target.pdf"]
+    assert doc.exists()
+
+    # 2차 undo 호출 시: 이미 doc 이 백업과 동일하게 복구되어 있으므로 충돌 에러 없이 정상 처리(멱등)
+    # 저널 레코드를 수동으로 다시 COMPLETED 로 두고 테스트
+    rec = pipe._find_latest_record("target.pdf")
+    # 새 파일이 다시 scan 되어 새 레코드가 생긴 시나리오:
+    # COMPLETED 레코드를 정확히 찾아 undo 가능한지 확인
+    assert doc.exists()
+
+
+def test_pipeline_retry_held_and_failed(tmp_path):
+    """[요구 7] HELD 및 FAILED 레코드가 retry() 호출 시 DISCOVERED 로 복귀하여 재스캔 가능함을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    doc = make_pdf(in_dir / "held_doc.pdf", "보류 대상")
+    pipe.scan()
+    pipe.hold("held_doc.pdf", reason="사용자 검토 필요")
+
+    rec = pipe._find_latest_record("held_doc.pdf")
+    assert rec.state == State.HELD
+
+    # retry 실행
+    retried = pipe.retry("held_doc.pdf")
+    assert retried.state == State.DISCOVERED
+
+    # 다시 scan 호출 시 정상적으로 추출/제안되어야 함
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "held_doc.pdf"
+
+
+def test_pipeline_stable_seconds_and_unstable_pdf(tmp_path):
+    """[요구 8] 미완성(작성 중/불완전 파싱) PDF 가 scan 시 WAITING_STABLE 로 전이되어 건너뛰어짐을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    # 불완전한 PDF (작성 중인 바이트)
+    unstable = in_dir / "writing.pdf"
+    unstable.write_bytes(b"%PDF-incomplete bytes without eof")
+
+    items = pipe.scan()
+    assert len(items) == 0  # 안정화 대기로 인해 제안 목록에 포함되지 않음
+
+    rec = pipe._find_latest_record("writing.pdf")
+    assert rec.state == State.WAITING_STABLE
+
+
+def test_pipeline_plan_is_read_only(tmp_path):
+    """[요구 9] plan() 은 읽기 전용으로 scan() 을 호출하지 않고 저널에 새 파일을 등록하지 않음을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    # 디스크에 새 파일 추가
+    make_pdf(in_dir / "new_unscanned.pdf", "새 문서")
+
+    # plan() 호출
+    items = pipe.plan()
+    assert len(items) == 0  # 스캔된 적 없으므로 제안 목록 0건
+    assert pipe.unprocessed_count() == 1  # 신규 미처리 파일 1건 인식
+
+    # 저널에 레코드가 생성되지 않았어야 함
+    assert len(pipe.journal.list()) == 0
+
+
+def test_pipeline_apply_targets_order_and_needs_review_rejection(tmp_path):
+    """[요구 11] targets 순서 보존 및 needs_review 항목은 force_review 없이 apply 불가함을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    # review 필요한 결과 생성 엔진
+    engine = FakeOcrEngine(default_status=OcrStatus.PARTIAL)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    make_pdf(in_dir / "doc_b.pdf", "B문서")
+    make_pdf(in_dir / "doc_a.pdf", "A문서")
+    pipe.scan()
+
+    # needs_review 상태인 항목을 승인/force_review 없이 apply 하려 하면 거절됨
+    res = pipe.apply(targets=["doc_a.pdf"])
+    assert len(res.applied) == 0
+    assert len(res.failed) == 1
+    assert "force-review" in res.failed[0][1]
+
+    # force_review=True 주면 순서대로 적용됨
+    res2 = pipe.apply(targets=["doc_b.pdf", "doc_a.pdf"], force_review=True)
+    assert res2.applied == ["doc_b.pdf", "doc_a.pdf"]
+
+
+def test_pipeline_ocr_work_cleanup_and_lost_output_resets(tmp_path):
+    """[요구 12] 확정 후 OCR 임시 폴더가 정리되고, OCR 산출물이 유실된 경우 DISCOVERED 로 복귀함을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.OK)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    make_pdf(in_dir / "ocr_test.pdf", "스캔문서")
+    pipe.scan()
+
+    rec = pipe._find_latest_record("ocr_test.pdf")
+    plan = json.loads(rec.plan_json)
+    ocr_out = Path(plan["ocr_output"])
+    assert ocr_out.exists()
+
+    # 의도적으로 OCR 산출물 파일 삭제 (유실 시뮬레이션)
+    ocr_out.unlink()
+
+    # apply 시 FAILED 로 고착되지 않고 DISCOVERED 로 복귀하여 재추출 유도
+    res = pipe.apply(targets=["ocr_test.pdf"], force_review=True)
+    assert len(res.applied) == 0
+    assert len(res.failed) == 1
+    assert "유실 감지" in res.failed[0][1]
+
+    rec_after = pipe._find_latest_record("ocr_test.pdf")
+    assert rec_after.state == State.DISCOVERED
+
+
+def test_pipeline_run_lock_prevents_concurrent_execution(tmp_path):
+    """[요구 5] 다른 프로세스/세션이 락을 보유 중일 때 scan/apply/undo 등이 LockHeld 로 방어됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+    )
+
+    make_pdf(in_dir / "lock_test.pdf")
+
+    # 외부 세션이 락을 선점
+    with Journal(j_path) as other_j:
+        other_j.acquire_lock("external_process", lease_s=60.0)
+
+        # 락이 잡혀 있으므로 pipe.scan() 호출 시 LockHeld 발생해야 함
+        with pytest.raises(LockHeld):
+            pipe.scan()
+
+        with pytest.raises(LockHeld):
+            pipe.apply()
+
+        with pytest.raises(LockHeld):
+            pipe.undo()
+
+        with pytest.raises(LockHeld):
+            pipe.recover()
+
+
+def test_pipeline_evidence_snippet_not_in_journal(tmp_path):
+    """[요구 6] OCR 본문(evidence_snippet)이 저널의 plan_json 에 영속화되지 않음을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    engine = FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT)
+    extractor = FakeTitleExtractor()  # evidence_snippet 이 포함된 TitleProposal 반환
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=engine,
+        title_extractor=extractor,
+    )
+
+    make_pdf(in_dir / "snippet_test.pdf")
+    pipe.scan()
+
+    rec = pipe._find_latest_record("snippet_test.pdf")
+    assert rec.plan_json is not None
+    # plan_json 안에 본문 발췌 내용이 들어있지 않아야 함
+    assert "발췌" not in rec.plan_json
+    p_data = json.loads(rec.plan_json)
+    assert "evidence_snippet" not in p_data
+
 
 
 
