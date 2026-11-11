@@ -23,17 +23,24 @@ from typing import Optional, Sequence
 
 from scaninbox.config import (
     Config,
+    ConfigError,
     app_data_dir,
     default_backup_dir,
     default_done_dir,
 )
 from scaninbox.contracts import OcrStatus, State
+from scaninbox.journal import (
+    IllegalTransition,
+    JournalError,
+    LockHeld,
+    LockLost,
+)
 from scaninbox.ocr import OcrmypdfEngine
-from scaninbox.pipeline import Pipeline
+from scaninbox.pipeline import ApplyResult, Pipeline
 from scaninbox.title import RuleTitleExtractor
 
 
-def _create_pipeline(args: argparse.Namespace) -> Pipeline:
+def _create_pipeline(args: argparse.Namespace, create_dirs: bool = False) -> Pipeline:
     scan_dir = Path(args.input_dir).resolve() if args.input_dir else Path("./input").resolve()
     done_dir = Path(args.done_dir).resolve() if args.done_dir else default_done_dir(scan_dir)
     backup_dir = Path(args.backup_dir).resolve() if args.backup_dir else default_backup_dir(scan_dir)
@@ -47,11 +54,16 @@ def _create_pipeline(args: argparse.Namespace) -> Pipeline:
     )
     engine = OcrmypdfEngine()
     title_ext = RuleTitleExtractor()
-    return Pipeline(config=cfg, ocr_engine=engine, title_extractor=title_ext)
+    return Pipeline(
+        config=cfg,
+        ocr_engine=engine,
+        title_extractor=title_ext,
+        create_dirs=create_dirs,
+    )
 
 
 def cmd_init(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
+    pipe = pipeline or _create_pipeline(args, create_dirs=True)
     pipe.scan_dir.mkdir(parents=True, exist_ok=True)
     pipe.done_dir.mkdir(parents=True, exist_ok=True)
     pipe.backup_dir.mkdir(parents=True, exist_ok=True)
@@ -63,7 +75,7 @@ def cmd_init(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
 
 
 def cmd_scan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
+    pipe = pipeline or _create_pipeline(args, create_dirs=True)
     items = pipe.scan()
     print(f"스캔 완료: 총 {len(items)}건 발견 및 제안 생성")
     for item in items:
@@ -73,7 +85,7 @@ def cmd_scan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
 
 
 def cmd_plan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
     items = pipe.plan()
 
     if args.json:
@@ -89,7 +101,6 @@ def cmd_plan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
                     "title": it.title.title,
                     "doc_date": it.title.doc_date,
                     "evidence_page": it.title.evidence_page,
-                    "evidence_snippet": it.title.evidence_snippet,
                     "warnings": it.warnings,
                 }
             )
@@ -99,79 +110,84 @@ def cmd_plan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
     print(f"=== 처리 계획 (총 {len(items)}건) ===")
     if not items:
         print("대기 중인 처리 항목이 없습니다.")
-        return 0
+    else:
+        for i, it in enumerate(items, 1):
+            review_mark = "[검토 필요]" if it.needs_review else "[승인 대기]"
+            print(f"\n{i}. {review_mark} {it.input_rel}")
+            print(f"   원본 해시 : {it.original_sha256[:8]}...")
+            print(f"   제안 파일명: {it.proposed_name}")
+            print(f"   OCR 상태  : {it.ocr_status.value}")
+            if it.title.doc_date:
+                print(f"   문서 날짜 : {it.title.doc_date}")
+            if it.title.evidence_page:
+                print(f"   제목 근거 : p.{it.title.evidence_page}")
+            if it.warnings:
+                print(f"   주의 사항 : {', '.join(it.warnings)}")
 
-    for i, it in enumerate(items, 1):
-        review_mark = "[검토 필요]" if it.needs_review else "[승인 대기]"
-        print(f"\n{i}. {review_mark} {it.input_rel}")
-        print(f"   원본 해시 : {it.original_sha256[:8]}...")
-        print(f"   제안 파일명: {it.proposed_name}")
-        print(f"   OCR 상태  : {it.ocr_status.value}")
-        if it.title.doc_date:
-            print(f"   문서 날짜 : {it.title.doc_date}")
-        if it.title.evidence_snippet:
-            print(f"   제목 근거 : p.{it.title.evidence_page or 1} \"{it.title.evidence_snippet}\"")
-        if it.warnings:
-            print(f"   주의 사항 : {', '.join(it.warnings)}")
+    unproc = pipe.unprocessed_count()
+    if unproc > 0:
+        print(f"\n[안내] 아직 스캔되지 않은 신규 파일 {unproc}건이 대기 중입니다. 'scaninbox scan'으로 처리하십시오.")
+
     return 0
 
 
 def cmd_apply(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
+    pipe = pipeline or _create_pipeline(args, create_dirs=True)
     targets = args.files if args.files else None
     if not targets and not args.approve_all:
         print("오류: 적용할 파일 목록을 지정하거나 --approve-all 플래그를 사용하십시오.", file=sys.stderr)
         return 1
 
-    try:
-        applied = pipe.apply(targets=targets, approve_all=args.approve_all)
-        print(f"적용 완료: {len(applied)}건 완료 폴더로 배치 및 입력 정리됨")
-        for f in applied:
+    res = pipe.apply(
+        targets=targets,
+        approve_all=args.approve_all,
+        force_review=getattr(args, "force_review", False),
+    )
+    if res.applied:
+        print(f"적용 완료: {len(res.applied)}건 완료 폴더로 배치 및 입력 정리됨")
+        for f in res.applied:
             print(f"  - {f}")
-        return 0
-    except Exception as ex:
-        print(f"적용 실패: {ex}", file=sys.stderr)
-        return 1
+    if res.failed:
+        print(f"적용 실패/제외: {len(res.failed)}건", file=sys.stderr)
+        for f, reason in res.failed:
+            print(f"  - {f}: {reason}", file=sys.stderr)
+
+    return 0 if (res.applied or not res.failed) else 1
+
+
+def cmd_retry(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
+    rec = pipe.retry(args.target)
+    print(f"재시도 등록 완료: [{rec.state.value}] {rec.input_rel} (id={rec.id})")
+    return 0
 
 
 def cmd_rename(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
-    try:
-        rec = pipe.rename(args.file, args.new_name)
-        print(f"이름 지정 완료 및 승인: {rec.input_rel}")
-        return 0
-    except Exception as ex:
-        print(f"이름 지정 실패: {ex}", file=sys.stderr)
-        return 1
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
+    rec = pipe.rename(args.file, args.new_name)
+    print(f"이름 지정 완료 및 승인: {rec.input_rel}")
+    return 0
 
 
 def cmd_hold(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
-    try:
-        reason = args.reason or "사용자 보류 요청"
-        rec = pipe.hold(args.file, reason=reason)
-        print(f"보류 처리 완료: {rec.input_rel} (사유: {reason})")
-        return 0
-    except Exception as ex:
-        print(f"보류 처리 실패: {ex}", file=sys.stderr)
-        return 1
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
+    reason = args.reason or "사용자 보류 요청"
+    rec = pipe.hold(args.file, reason=reason)
+    print(f"보류 처리 완료: {rec.input_rel} (사유: {reason})")
+    return 0
 
 
 def cmd_undo(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
-    try:
-        undone = pipe.undo(input_rel=args.file)
-        print(f"되돌리기 완료: {len(undone)}건 원본 복구 및 완료 파일 삭제됨")
-        for f in undone:
-            print(f"  - {f}")
-        return 0
-    except Exception as ex:
-        print(f"되돌리기 실패: {ex}", file=sys.stderr)
-        return 1
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
+    undone = pipe.undo(input_rel=args.file)
+    print(f"되돌리기 완료: {len(undone)}건 원본 복구 및 완료 파일 삭제됨")
+    for f in undone:
+        print(f"  - {f}")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
     records = pipe.journal.list()
     print("=== Scan Inbox 상태 요약 ===")
     counts: dict[str, int] = {}
@@ -186,20 +202,16 @@ def cmd_status(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) ->
 
 
 def cmd_recover(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
-    try:
-        recovered = pipe.recover()
-        print(f"복구 완료: {len(recovered)}건 복구됨")
-        for f in recovered:
-            print(f"  - {f}")
-        return 0
-    except Exception as ex:
-        print(f"복구 실패: {ex}", file=sys.stderr)
-        return 1
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
+    recovered = pipe.recover()
+    print(f"복구 완료: {len(recovered)}건 복구됨")
+    for f in recovered:
+        print(f"  - {f}")
+    return 0
 
 
 def cmd_export_ledger(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
-    pipe = pipeline or _create_pipeline(args)
+    pipe = pipeline or _create_pipeline(args, create_dirs=False)
     ledger = pipe.export_ledger(path=args.output)
     if not args.output:
         sys.stdout.write(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n")
@@ -237,7 +249,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply = subparsers.add_parser("apply", help="승인 항목 확정 배치 및 입력 정리")
     p_apply.add_argument("files", nargs="*", help="적용할 파일 목록 (지정하지 않으면 승인 대기 항목 전체)")
     p_apply.add_argument("--approve-all", action="store_true", help="검토 대기 항목 일괄 승인 및 적용")
+    p_apply.add_argument("--force-review", action="store_true", help="검토 필요(needs_review) 항목도 강제 승인하여 적용")
     p_apply.set_defaults(func=cmd_apply)
+
+    # retry
+    p_retry = subparsers.add_parser("retry", help="보류(HELD) 또는 실패(FAILED) 항목 재시도")
+    p_retry.add_argument("target", help="재시도할 파일 상대경로 또는 저널 ID")
+    p_retry.set_defaults(func=cmd_retry)
 
     # rename
     p_rename = subparsers.add_parser("rename", help="검토 항목 이름 지정 및 승인")
@@ -274,8 +292,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        args = parser.parse_args(argv)
+        return args.func(args)
+    except (
+        ConfigError,
+        IllegalTransition,
+        LockHeld,
+        LockLost,
+        JournalError,
+        ValueError,
+        FileNotFoundError,
+        FileExistsError,
+        KeyError,
+    ) as e:
+        sys.stderr.write(f"오류: {e}\n")
+        return 1
 
 
 if __name__ == "__main__":
