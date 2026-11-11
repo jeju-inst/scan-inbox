@@ -297,6 +297,14 @@ class Pipeline:
 
                     # 2. 보호 (BACKED_UP 에 backup_rel 기록)
                     backup_rel = rel
+                    # 백업 경로의 중간 폴더가 symlink/junction 이면 입력을 "이미 있는 백업"으로 오인할 수 있다
+                    try:
+                        ensure_within(self.backup_dir, backup_rel)
+                    except Exception as e:
+                        self.journal.transition(
+                            rec.id, State.FAILED, reason=f"백업 경로 검증 실패(링크 또는 루트 밖): {e}"
+                        )
+                        continue
                     bk_target = self.backup_dir / backup_rel
                     if bk_target.exists() and sha256_file(bk_target) != sha256:
                         stem = Path(rel).stem
@@ -624,6 +632,12 @@ class Pipeline:
                         failed.append((rec.input_rel, reason))
                         continue
 
+                    try:
+                        ensure_within(self.backup_dir, rec.backup_rel)
+                    except Exception as e:
+                        reason = f"백업 경로 검증 실패(링크 또는 루트 밖): {e}"
+                        self.journal.transition(rec.id, State.FAILED, reason=reason)
+                        raise ValueError(reason)
                     bk_path = self.backup_dir / rec.backup_rel
                     if not bk_path.exists():
                         reason = f"백업 파일 소실: {rec.backup_rel}"
@@ -694,6 +708,11 @@ class Pipeline:
 
                     # 8. 입력 정리 대기 및 입력 파일 제거
                     rec = self.journal.transition(rec.id, State.SOURCE_CLEANUP_PENDING)
+                    # 발행 중에 스캐너·동기화가 입력을 교체했을 수 있다: 승인·백업된 바이트와 같을 때만 삭제
+                    if not src_input.exists() or sha256_file(src_input) != rec.original_sha256:
+                        reason = "삭제 직전 입력 내용 변경 감지: 승인되지 않은 새 파일이라 삭제하지 않고 보류"
+                        self.journal.transition(rec.id, State.HELD, reason=reason)
+                        raise ValueError(reason)
                     src_input.unlink()
 
                     # 9. 완료 영속화 (규약 2: approved_by_user=True)

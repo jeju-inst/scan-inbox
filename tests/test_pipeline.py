@@ -1293,3 +1293,63 @@ def test_pipeline_scan_aborts_on_lock_lost(tmp_path):
 
 
 
+
+
+def test_pipeline_backup_path_through_symlink_rejected(tmp_path):
+    """backup_dir 아래 하위 폴더가 입력 폴더를 가리키는 symlink 면 입력을 '이미 있는 백업'으로 오인하지 않는다 (Codex P1)."""
+    in_dir = tmp_path / "in"
+    (in_dir / "sub").mkdir(parents=True)
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    backup_dir.mkdir()
+    try:
+        os.symlink(in_dir / "sub", backup_dir / "sub", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink 생성 불가 환경")
+
+    pipe = Pipeline(
+        scan_dir=in_dir, done_dir=done_dir, backup_dir=backup_dir,
+        journal_path=tmp_path / "j.sqlite",
+        ocr_engine=FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT),
+    )
+    f1 = in_dir / "sub" / "doc.pdf"
+    make_pdf(f1, "링크 경유 백업 시험")
+    pipe.scan()
+    res = pipe.apply(approve_all=True)
+
+    assert res.applied == []
+    assert f1.exists(), "링크를 거친 가짜 백업 때문에 입력이 삭제되면 안 됨"
+    assert list(done_dir.glob("**/*.pdf")) == []
+    assert any(r.state == State.FAILED for r in pipe.journal.list())
+
+
+def test_pipeline_input_replaced_during_publish_is_not_deleted(tmp_path, monkeypatch):
+    """발행 도중 입력이 교체되면 새 파일을 삭제하지 않고 HELD 로 보류한다 (Codex P1)."""
+    import scaninbox.pipeline as pl
+
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    pipe = Pipeline(
+        scan_dir=in_dir, done_dir=done_dir, backup_dir=tmp_path / "bk",
+        journal_path=tmp_path / "j.sqlite",
+        ocr_engine=FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT),
+    )
+    f1 = in_dir / "doc.pdf"
+    make_pdf(f1, "원본 내용")
+    pipe.scan()
+    pipe.approve("doc.pdf")
+
+    real_move = pl.move_no_overwrite
+
+    def swap_after_publish(src, dst):
+        real_move(src, dst)
+        f1.write_bytes(b"%PDF-1.4 replacement scanned later")
+
+    monkeypatch.setattr(pl, "move_no_overwrite", swap_after_publish)
+    res = pipe.apply(approve_all=False)
+
+    assert res.applied == []
+    assert len(res.failed) == 1 and "입력 내용 변경" in res.failed[0][1]
+    assert f1.read_bytes() == b"%PDF-1.4 replacement scanned later"
+    rec = pipe.journal.list()[0]
+    assert rec.state == State.HELD
