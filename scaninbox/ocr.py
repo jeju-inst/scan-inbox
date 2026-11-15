@@ -627,7 +627,8 @@ def _page_scores(texts: Sequence[str]) -> list[float]:
 def _plan_pages(attempts: Sequence[OcrResult]) -> list[int]:
     """쪽마다 어느 시도(0=첫 시도)의 결과를 쓸지 고른다. 첫 시도보다 ``MERGE_MARGIN`` 이상 점수가 높은 시도만 대체한다.
 
-    첫 시도 쪽이 비어 있으면(0자) 다른 시도의 쪽은 가독성이 ``RETRY_READABILITY`` 이상이고 20자 이상일 때만 쓴다.
+    첫 시도 쪽이 비어 있으면(0자) 다른 시도의 쪽은 가독성이 ``RETRY_READABILITY`` 이상이고 20자 이상일 때만 쓴다(빈 쪽 복원).
+    비어 있지 않은 쪽의 교체는 길이 하한 없이 점수 마진만 본다(짧은 쪽도 읽을 수 있게 고쳐졌다면 채택).
     같은 쪽 수의 시도들만 비교한다."""
     first = attempts[0]
     n = len(first.text_by_page)
@@ -638,7 +639,8 @@ def _plan_pages(attempts: Sequence[OcrResult]) -> list[int]:
         base = scores[0][i]
         best = base
         for k in range(1, len(attempts)):
-            if scores[k] is None or compact_len(attempts[k].text_by_page[i]) < MIN_PAGE_CHARS:
+            ck = compact_len(attempts[k].text_by_page[i])
+            if scores[k] is None or ck == 0 or (base_empty and ck < MIN_PAGE_CHARS):
                 continue
             sc = scores[k][i]
             need = RETRY_READABILITY if base_empty else base + MERGE_MARGIN

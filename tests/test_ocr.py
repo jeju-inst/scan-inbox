@@ -410,6 +410,8 @@ def test_plan_pages_picks_most_readable_attempt_per_page_without_suspect_flag():
     assert _plan_pages([a12, a05]) == [0, 0, 1, 0, 0]
     # 동률·근소차는 첫 시도 유지, 첫 시도 쪽이 비었을 때 다른 시도의 잡음 쪽은 채택하지 않음
     assert _plan_pages([_fake_attempt([_KO_PROSE, ""]), _fake_attempt([_KO_PROSE, _PG_BAD_4])]) == [0, 0]
+    # 비어 있지 않은 쪽의 교체에는 20자 하한이 없다: 짧지만 읽을 수 있게 고쳐진 쪽은 채택
+    assert _plan_pages([_fake_attempt(["x Q 7 | a"]), _fake_attempt(["현장 점검 결과"])]) == [1]
     # 첫 시도에서 비어 있던 쪽을 다른 시도가 읽어 내면(읽을 수 있을 때만) 채택
     assert _plan_pages([_fake_attempt([_KO_PROSE, ""]), _fake_attempt([_KO_PROSE, _PG_GOOD_4])]) == [0, 1]
 
