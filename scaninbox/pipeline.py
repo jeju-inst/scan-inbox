@@ -85,6 +85,9 @@ class ApplyResult(Sequence[str]):
 class Pipeline:
     """Scan Inbox 핵심 파이프라인."""
 
+    # 직전 undo() 의 항목별 실패 목록 [(input_rel, 사유)] — CLI 가 종료코드에 반영
+    last_undo_failures: list = []
+
     def __init__(
         self,
         config: Optional[Config] = None,
@@ -757,6 +760,7 @@ class Pipeline:
                 candidates = self.journal.list(State.COMPLETED)
 
             undone: list[str] = []
+            self.last_undo_failures = []
             for rec in candidates:
                 try:
                     dest_input = self.scan_dir / rec.input_rel
@@ -794,6 +798,7 @@ class Pipeline:
                     undone.append(rec.input_rel)
                 except Exception as ex:
                     log.exception("되돌리기 중 오류 발생: %s (%s)", rec.input_rel, ex)
+                    self.last_undo_failures.append((rec.input_rel, str(ex)))
                     if input_rel:
                         raise
 

@@ -345,3 +345,28 @@ def test_cli_retry_command(cli_env, capsys):
     rec = pipe._find_latest_record("held.pdf")
     assert rec.state == State.DISCOVERED
 
+
+
+def test_cli_undo_all_reports_failures_with_exit_1(cli_env, capsys):
+    """파일명 없는 일괄 undo 에서 항목이 실패하면 CLI 가 성공(0)으로 끝나면 안 된다 (Codex P2)."""
+    in_dir, done_dir, backup_dir, j_path = cli_env
+    make_pdf(in_dir / "undo_fail.pdf", "되돌리기 실패 시험")
+    pipe = Pipeline(
+        scan_dir=in_dir, done_dir=done_dir, backup_dir=backup_dir, journal_path=j_path,
+        ocr_engine=FakeCliOcrEngine(), title_extractor=FakeCliTitleExtractor(),
+    )
+    pipe.scan()
+    pipe.apply(approve_all=True)
+    # 백업을 변조해 복원이 불가능하게 만든다
+    for f in backup_dir.rglob("*.pdf"):
+        f.write_bytes(b"%PDF-1.4 corrupted")
+
+    parser = cli.build_parser()
+    args = parser.parse_args([
+        "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir), "undo",
+    ])
+    ret = cli.cmd_undo(args, pipeline=pipe)
+    out = capsys.readouterr().out
+    assert ret == 1
+    assert "되돌리기 실패: 1건" in out
+    assert [r.state.value for r in pipe.journal.list()] == ["completed"]

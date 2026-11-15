@@ -183,6 +183,12 @@ def cmd_undo(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
     print(f"되돌리기 완료: {len(undone)}건 원본 복구 및 완료 파일 삭제됨")
     for f in undone:
         print(f"  - {f}")
+    failures = getattr(pipe, "last_undo_failures", [])
+    if failures:
+        print(f"되돌리기 실패: {len(failures)}건 (해당 항목은 COMPLETED 상태 그대로 유지됨)")
+        for rel, reason in failures:
+            print(f"  ! {rel}: {reason}")
+        return 1
     return 0
 
 
