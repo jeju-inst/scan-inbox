@@ -370,3 +370,114 @@ def test_cli_undo_all_reports_failures_with_exit_1(cli_env, capsys):
     assert ret == 1
     assert "되돌리기 실패: 1건" in out
     assert [r.state.value for r in pipe.journal.list()] == ["completed"]
+
+
+def test_cli_waiting_stable_ux_in_scan_plan_status(cli_env, capsys):
+    """손상 PDF 첫 스캔 직후 scan/status/plan 에서 안정화 대기 건수·남은 시간·파싱 실패 원인을 안내하고 stderr 경고가 없음을 검증."""
+    in_dir, done_dir, backup_dir, j_path = cli_env
+    corrupt_pdf = in_dir / "corrupt.pdf"
+    corrupt_pdf.write_bytes(b"%PDF-1.4 truncated without eof")
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=FakeCliOcrEngine(),
+        title_extractor=FakeCliTitleExtractor(),
+    )
+    parser = cli.build_parser()
+
+    # 1) scan 종료 요약에 안정화 대기 N건(약 M초 후 다시 scan) 및 사유 출력, pypdf stderr 억제 확인
+    args_scan = parser.parse_args([
+        "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir), "scan",
+    ])
+    ret_scan = cli.cmd_scan(args_scan, pipeline=pipe)
+    assert ret_scan == 0
+    cap_scan = capsys.readouterr()
+    assert "EOF marker not found" not in cap_scan.err
+    assert "안정화 대기 1건(약 " in cap_scan.out
+    assert "초 후 다시 scan)" in cap_scan.out
+    assert "불완전 스트림/EOF 누락" in cap_scan.out
+
+    # 2) status 에 waiting_stable 건수와 남은 대기 시간 힌트 출력 확인
+    args_status = parser.parse_args([
+        "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir), "status",
+    ])
+    ret_status = cli.cmd_status(args_status, pipeline=pipe)
+    assert ret_status == 0
+    cap_status = capsys.readouterr()
+    assert "waiting_stable: 1건" in cap_status.out
+    assert "안정화 대기 1건(약 " in cap_status.out
+    assert "초 후 다시 scan)" in cap_status.out
+    assert "불완전 스트림/EOF 누락" in cap_status.out
+
+    # 3) plan 에도 안정화 대기 안내가 출력되고 '신규 파일 대기'로 오안내하지 않음을 확인
+    args_plan = parser.parse_args([
+        "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir), "plan",
+    ])
+    ret_plan = cli.cmd_plan(args_plan, pipeline=pipe)
+    assert ret_plan == 0
+    cap_plan = capsys.readouterr()
+    assert "안정화 대기 1건(약 " in cap_plan.out
+    assert "초 후 다시 scan)" in cap_plan.out
+    assert "불완전 스트림/EOF 누락" in cap_plan.out
+    assert "아직 스캔되지 않은 신규 파일" not in cap_plan.out
+
+
+def test_cli_apply_force_review_standalone_and_help(cli_env, capsys):
+    """apply --force-review 단독 실행 시 검토 필요 항목만 승인·적용되며 도움말에 안내가 포함되어 있음을 검증."""
+    in_dir, done_dir, backup_dir, j_path = cli_env
+    make_pdf(in_dir / "normal_doc.pdf", "정상 문서")
+    make_pdf(in_dir / "review_doc.pdf", "검토 문서")
+
+    class ReviewAwareTitleExtractor:
+        def propose(self, pdf_path: Path, text_by_page: list[str]) -> TitleProposal:
+            if "review" in pdf_path.name:
+                return TitleProposal(
+                    title=None,
+                    evidence_page=1,
+                    evidence_snippet="",
+                    doc_date=None,
+                    doc_type="보고서",
+                    review_reasons=["제목 불확실"],
+                )
+            return TitleProposal(
+                title="정상제목",
+                evidence_page=1,
+                evidence_snippet="",
+                doc_date="2026-11-05",
+                doc_type="보고서",
+                review_reasons=[],
+            )
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=FakeCliOcrEngine(),
+        title_extractor=ReviewAwareTitleExtractor(),
+    )
+    pipe.scan()
+
+    parser = cli.build_parser()
+    # 도움말에 --force-review 단독 및 병행 동작이 명시되어 있는지 확인
+    apply_subparser = [
+        action for action in parser._actions if isinstance(action, cli.argparse._SubParsersAction)
+    ][0].choices["apply"]
+    help_txt = apply_subparser.format_help()
+    assert "--force-review" in help_txt
+    assert "단독 실행 시 검토 필요 항목만" in help_txt
+
+    # apply --force-review 단독 실행
+    args_force = parser.parse_args([
+        "--input-dir", str(in_dir), "--done-dir", str(done_dir), "--backup-dir", str(backup_dir),
+        "apply", "--force-review",
+    ])
+    ret = cli.cmd_apply(args_force, pipeline=pipe)
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "review_doc.pdf" in out
+    assert not (in_dir / "review_doc.pdf").exists()
+    assert (in_dir / "normal_doc.pdf").exists()
