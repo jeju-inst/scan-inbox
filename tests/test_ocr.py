@@ -22,7 +22,7 @@ import pytest
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 
-from scaninbox.contracts import OcrStatus
+from scaninbox.contracts import OcrResult, OcrStatus
 from scaninbox.ocr import (DEFAULT_ROTATE_THRESHOLD, OcrEnvironmentError, OcrmypdfEngine, page_text_quality,
                            suspect_pages)
 
@@ -307,10 +307,11 @@ def test_retry_with_lower_threshold_when_suspect_pages(fake_env, tmp_path, monke
     calls = tp / "calls.txt"
     monkeypatch.setenv("FAKE_CALLS_FILE", str(calls))
     # 임계값 1.2 로 만든 출력은 2쪽이 의심, 0.5 로 만든 출력은 정상이라고 판정하는 가짜 판정기
-    monkeypatch.setattr(ocr_mod, "suspect_pages", lambda texts: [2] if any("thr=1.2" in t for t in texts) else [])
+    monkeypatch.setattr(ocr_mod, "suspect_pages",
+                        lambda texts: [2] if len(texts) > 1 and "page 2 thr=1.2" in texts[1] else [])
     res = eng.run(_image_only_pdf(tp / "in.pdf", pages=2), tp / "out")
     assert calls.read_text().split() == ["1.2", "0.5"]
-    assert res.status is OcrStatus.OK and "0.5" in res.reason and "rotate-threshold=0.5" in res.engine
+    assert res.status is OcrStatus.OK and "0.5" in res.engine and "page 2 thr=0.5" in res.text_by_page[1]
     assert len(list((tp / "out").glob("*.pdf"))) == 1  # 채택되지 않은 첫 출력은 지워진다
 
 
@@ -367,6 +368,57 @@ def test_suspect_pages_flags_low_hangul_garbage_with_some_hangul():
     assert suspect_pages([good, good, english]) == []
 
 
+# 합성 코퍼스 rotated_blank 를 글꼴·임계값별로 OCR 한 실제 출력(합성 데이터). 방향이 어긋난 쪽은 숫자·라틴 잡음이 된다.
+_PG_GOOD_3 = "예 시시 가상 과\n[ 옆으로 AWS 쪽 ] 이 페이지는 가로 방향 종이로 스캔된 것처럼 이미지 자체 가 90 도 회전되어 있음"
+_PG_GOOD_4 = "[회전 속성쪽 ] 이미지는바르게서있으나 PDF 쪽회전속성이 90 도로지정되어 있음. \n"
+_PG_BAD_3 = "` 뮤 1 아아 81<2\\ 릉 lolelvi2 SA S yo \n“Sid lolsizls 506 14101 Ivlolo 212 BRY SloL RR Sle 극 |1"
+_PG_BAD_4 = '"2% 10521 23506 lok Mis = 40d HOW by ᅵ <2\\ 극 | 니미 0 [ 높 FY Es) \nte Rc lylvllo'
+_PG_BAD_4W = "“SYS 103 23506 loRs wis 늘 300 17016 fy kel Slvlolo ls FS Rb) \n42F1c ly lyllo \n"  # Windows/5.4.0
+_PG_GOOD_4W = "[회전 속성쪽 ] 이미지는바르게서있으나『매쪽회전속성이 90 도로지정되어 있음. \n"  # 낱기호가 섞인 정상 쪽
+_PG_BAD_4B = "“SYS lols Riv S506 106 누분휴눈 30017616 by ela Slviolo fe 6 누 Is] \n"
+_EN_PROSE = ("The annual facility inspection report summarizes the maintenance work completed this quarter "
+             "and lists the items scheduled for the next period.")
+_KO_PROSE = "현장 점검 결과를 정리한 보고서입니다. 다음 분기에 예정된 정비 항목을 함께 적었습니다."
+_NUM_TABLE = "구분 1분기 2분기 3분기 4분기\n예산 1,200 1,350 1,100 1,500\n집행 1,180 1,290 1,050 1,480"
+
+
+def test_readability_separates_noise_from_text_in_real_ocr_output():
+    from scaninbox.ocr import page_readability
+    for good in (_PG_GOOD_3, _PG_GOOD_4, _PG_GOOD_4W, _EN_PROSE, _KO_PROSE, _NUM_TABLE):
+        assert page_readability(good) >= 0.85, good
+    for bad in (_PG_BAD_3, _PG_BAD_4, _PG_BAD_4W, _PG_BAD_4B):
+        assert page_readability(bad) < 0.72, bad
+    assert page_readability("") == 0.0
+
+
+def test_retry_trigger_ignores_clean_english_korean_numeric_and_single_pages():
+    from scaninbox.ocr import _needs_retry
+    assert not _needs_retry([_EN_PROSE])
+    assert not _needs_retry([_KO_PROSE])
+    assert not _needs_retry([_KO_PROSE, _EN_PROSE, _NUM_TABLE, ""])  # 빈 쪽은 재시도 사유가 아님
+    assert _needs_retry([_PG_GOOD_3, _PG_BAD_4])
+    assert _needs_retry([_PG_BAD_3])  # 한 쪽짜리여도 쓰레기면 재시도
+
+
+def _fake_attempt(texts):
+    return OcrResult(OcrStatus.OK, output=Path("x.pdf"), page_count_in=len(texts), page_count_out=len(texts),
+                     text_by_page=texts)
+
+
+def test_plan_pages_picks_most_readable_attempt_per_page_without_suspect_flag():
+    """맥 NotoSansKR: 1.2 에서는 3쪽이, 0.5 에서는 4쪽이 쓰레기. 의심 판정 여부와 무관하게 쪽마다 더 읽히는 시도를 고른다."""
+    from scaninbox.ocr import _plan_pages
+    a12 = _fake_attempt([_KO_PROSE, "", _PG_BAD_3, _PG_GOOD_4, ""])
+    a05 = _fake_attempt([_KO_PROSE, "", _PG_GOOD_3, _PG_BAD_4, ""])
+    assert _plan_pages([a12, a05]) == [0, 0, 1, 0, 0]
+    # 동률·근소차는 첫 시도 유지, 첫 시도 쪽이 비었을 때 다른 시도의 잡음 쪽은 채택하지 않음
+    assert _plan_pages([_fake_attempt([_KO_PROSE, ""]), _fake_attempt([_KO_PROSE, _PG_BAD_4])]) == [0, 0]
+    # 비어 있지 않은 쪽의 교체에는 20자 하한이 없다: 짧지만 읽을 수 있게 고쳐진 쪽은 채택
+    assert _plan_pages([_fake_attempt(["x Q 7 | a"]), _fake_attempt(["현장 점검 결과"])]) == [1]
+    # 첫 시도에서 비어 있던 쪽을 다른 시도가 읽어 내면(읽을 수 있을 때만) 채택
+    assert _plan_pages([_fake_attempt([_KO_PROSE, ""]), _fake_attempt([_KO_PROSE, _PG_GOOD_4])]) == [0, 1]
+
+
 def test_cancel_during_retry_propagates_and_cleans_up(fake_env, tmp_path, monkeypatch):
     import scaninbox.ocr as ocr_mod
     eng, tp = fake_env
@@ -416,7 +468,8 @@ def test_garbage_page_is_flagged_only_when_it_deviates_from_the_document():
     assert suspect_pages([PAGE1, GARBAGE]) == [2]
     assert suspect_pages([PAGE1, GOOD_KO]) == []
     assert suspect_pages([PAGE1, PAGE1, EN_PAGE]) == []  # 한글 문서에 영문 쪽이 섞여도 오탐하지 않음
-    assert suspect_pages([GARBAGE]) == []  # 비교 대상이 없는 한 쪽짜리는 절대 지표만 본다
+    # 비교 대상이 없는 한 쪽짜리는 문서 내 비교는 못 하고 가독성 절대값(0.72 미만)으로만 의심한다
+    assert suspect_pages([GARBAGE]) == [1]
     assert page_text_quality("") == 0.0
 
 

@@ -74,6 +74,14 @@ MIN_PAGE_CHARS = 20
 #: ``page_text_quality`` 가 이 값 미만이면 "인식 품질 의심". 약한 절대 지표(``suspect_pages`` 참조).
 MIN_PAGE_QUALITY = 0.45
 
+#: 쪽 가독성(``page_readability``)이 이 값 미만이면 다른 회전 임계값으로 다시 읽어 볼 가치가 있는 쪽이다(재시도 조건).
+#: 합성 코퍼스 정상 쪽은 0.94 이상(문서 전체에서는 0.85 이상), 90도 어긋난 쓰레기 쪽은 0.49~0.70 이었다(macOS·Windows, 글꼴 4종).
+RETRY_READABILITY = 0.80
+#: 이 값 미만이면 인식 품질 의심 쪽으로 표시한다(쪽이 남으면 ``partial``).
+MIN_READABILITY = 0.72
+#: 시도 간 쪽 병합에서 다른 시도의 쪽이 첫 시도 쪽을 대체하려면 가독성이 이만큼 더 높아야 한다(동률·근소차는 첫 시도 유지).
+MERGE_MARGIN = 0.15
+
 _KILL_GRACE_S = 3.0
 _POLL_S = 0.2
 
@@ -138,12 +146,45 @@ def page_text_quality(text: str) -> float:
     return max(0.0, min(1.0, 1.0 - (single_ratio * 0.7 + (odd_ratio + nul_ratio) * 1.5)))
 
 
+_STOP_WORDS = frozenset("of to in on at by is it as an or we be do no so if my me he up us am go".split())
+_TOK_STRIP = "\"'“”‘’()[]{}<>.,:;!?·-—–~…*|/\\"
+_HANGUL_CH = re.compile(r"[가-힣]")
+_LATIN_TOK = re.compile(r"[A-Za-z]{3,}")
+_NUM_TOK = re.compile(r"\d{1,4}(?:[.,/:-]\d{1,4})*")
+_UNIT_TOK = re.compile(r"\d{1,4}(?:[.,]\d{1,4})*(?:[가-힣]+|%)|[가-힣]+\d{1,4}")
+
+
+def page_readability(text: str) -> float:
+    """쪽 텍스트가 읽을 수 있는 글인 정도(0~1): 짧은 단위(공백 구분) 중 '말이 되는 모양'인 글자의 비율.
+
+    말이 되는 모양 = 한글 위주(80% 이상) 토큰(낱기호 한두 개는 허용), 영문 3자 이상이며 소문자·대문자·첫 글자 대문자인 토큰, 흔한 2자 영단어,
+    4자리 이하 숫자(날짜·금액 구분 기호 포함), 숫자+한글 단위(``1분기``, ``2026년도``)·한글+숫자. 반대로 숫자·기호가 섞인 토큰(``lolelvi2``, ``81<2\\``,
+    ``S506``), 대소문자가 섞인 라틴 조각(``IcSinS``), 5자리 이상 숫자열은 인식 잡음으로 본다.
+
+    **절대값보다 같은 쪽의 다른 시도와의 상대 비교에 쓰는 지표**다(``_plan_pages``). 사전·언어 모델이 아니라서 한글
+    잡음이 한글 토큰으로 나오면 점수가 부풀 수 있다(합성 코퍼스: 정상 쪽 0.94 이상 대 쓰레기 쪽 0.49~0.70, macOS·Windows 글꼴 4종)."""
+    clean = total = 0
+    for tok in unicodedata.normalize("NFC", _CTRL_RE.sub("", text)).split():
+        core = tok.strip(_TOK_STRIP)
+        if not core:
+            continue
+        n = len(core)
+        total += n
+        hangul = len(_HANGUL_CH.findall(core))
+        if hangul / n >= 0.8:  # 한글 위주 토큰은 낱기호가 한두 개 섞여도(``『매쪽``) 한글 글자 수만큼 인정
+            clean += hangul
+        elif ((_LATIN_TOK.fullmatch(core) and (core.islower() or core.isupper() or core.istitle()))
+                or core.lower() in _STOP_WORDS or _NUM_TOK.fullmatch(core) or _UNIT_TOK.fullmatch(core)):
+            clean += n
+    return clean / total if total else 0.0
+
+
 def suspect_pages(texts: Sequence[str]) -> list[int]:
     """텍스트는 있으나 읽을 수 없는 글일 가능성이 큰 쪽(1부터).
 
-    규칙(둘 중 하나):
+    규칙(셋 중 하나):
 
-    1. 절대 하한: ``page_text_quality < MIN_PAGE_QUALITY``.
+    1. 절대 하한: ``page_text_quality < MIN_PAGE_QUALITY``, 또는 20자 이상인 쪽의 ``page_readability < MIN_READABILITY``.
     2. 문자 구성 이탈: 같은 문서의 다른 쪽들은 한글 위주(한글 비율 ≥ 0.3)인데 이 쪽은 한글이 적고(< 0.2)
        2자 이하 조각이 많음(≥ 0.3). Tesseract 가 한글 쪽을 잘못된 방향으로 읽으면 라틴 문자 쓰레기가 나오는
        G0 사례를 겨냥한다. 한 쪽짜리 문서나 영문 문서에는 적용되지 않는다(비교 대상이 없음). 영문 쪽이 섞인 묶음은
@@ -158,7 +199,8 @@ def suspect_pages(texts: Sequence[str]) -> list[int]:
     for i, t in enumerate(texts):
         if compact_len(t) == 0:
             continue
-        bad = page_text_quality(t) < MIN_PAGE_QUALITY
+        bad = page_text_quality(t) < MIN_PAGE_QUALITY or (
+            compact_len(t) >= MIN_PAGE_CHARS and page_readability(t) < MIN_READABILITY)
         others = [shares[j] for j in range(n) if j != i and shares[j] is not None]
         if not bad and shares[i] is not None and others:
             others_sorted = sorted(others)
@@ -401,76 +443,61 @@ class OcrmypdfEngine:
             return OcrResult(OcrStatus.FAILED, page_count_in=pages_in, reason=str(e))
         dst_dir.mkdir(parents=True, exist_ok=True)
 
-        best = self._run_once(src, dst_dir, langs, pages_in, engine, self._rotate_threshold, timeout_s, cancel)
-        attempts = [best]  # 결과를 낸 시도들(쪽별 병합 후보). best 도 이 안에 있다.
+        first = self._run_once(src, dst_dir, langs, pages_in, engine, self._rotate_threshold, timeout_s, cancel)
+        attempts = [first]  # 결과를 낸 시도들. 쪽마다 시도들 중 가독성이 가장 높은 것을 고른다.
         for thr in self._retry:
             remaining = timeout_s - (time.monotonic() - t0)
-            if remaining < 5 or best.status not in (OcrStatus.OK, OcrStatus.PARTIAL) or not _has_suspect(best):
+            picks = _plan_pages(attempts)
+            if (remaining < 5 or first.status not in (OcrStatus.OK, OcrStatus.PARTIAL)
+                    or not _needs_retry([attempts[k].text_by_page[i] for i, k in enumerate(picks)])):
                 break
             alt = self._run_once(src, dst_dir, langs, pages_in, engine, thr, int(remaining), cancel)
             if cancel is not None and cancel.is_set():
                 # 재시도 중 취소: 앞선 결과로 되돌아가지 않고 취소를 그대로 전달한다(보관 중이던 출력은 정리).
-                for a in attempts:
-                    self._discard(a.output)
+                for a_ in attempts:
+                    self._discard(a_.output)
                 self._discard(alt.output)
                 return OcrResult(OcrStatus.FAILED, page_count_in=pages_in, engine=alt.engine, reason="취소됨")
-            if alt.output is None:
-                continue
-            attempts.append(alt)
-            if _problem_pages(alt) < _problem_pages(best):
-                alt.reason = (alt.reason + "; " if alt.reason else "") + f"회전 임계값 {thr} 로 재실행한 결과를 채택"
-                best = alt
-        if len(attempts) > 1 and _has_suspect(best):
-            merged = self._merge_attempts(best, attempts, dst_dir, pages_in, engine)
-            if merged is not None:
-                best = merged
-        for a in attempts:  # 채택하지 않은 시도의 출력을 정리한다(병합본은 별도 파일)
-            if a is not best:
-                self._discard(a.output)
+            if alt.output is not None:
+                attempts.append(alt)
+        best = self._materialize(attempts, dst_dir, pages_in)
+        for a_ in attempts:  # 채택하지 않은 시도의 출력을 정리한다(병합본은 별도 파일)
+            if a_ is not best:
+                self._discard(a_.output)
         log.info("ocr status=%s pages=%d->%d empty=%d sec=%.1f", best.status.value, best.page_count_in,
                  best.page_count_out, len(best.empty_pages), time.monotonic() - t0)
         return best
 
-    def _merge_attempts(self, best: OcrResult, attempts: Sequence[OcrResult], dst_dir: Path, pages_in: int,
-                        engine: str) -> Optional[OcrResult]:
-        """의심 쪽을 다른 임계값 시도의 읽을 수 있는 쪽으로 바꿔 끼운 PDF 를 만든다(문제 쪽이 줄 때만 반환).
-
-        회전 임계값은 쪽마다 최적값이 다르다(이미지 회전 쪽은 높은 값에서, ``/Rotate`` 쪽은 낮은 값에서 깨지는 글꼴·
-        Tesseract 조합이 있어 어떤 단일 값도 두 쪽을 모두 살리지 못한다). OCRmyPDF 출력은 쪽 단위로 독립이므로
-        시도별 출력에서 쪽을 골라 합친다. 합친 결과는 ``_verify`` 로 다시 검증한다(쪽 수·텍스트 재추출)."""
-        texts = list(best.text_by_page)
-        pick: dict[int, OcrResult] = {}
-        for page in suspect_pages(texts):
-            for a in attempts:
-                if a is best or a.output is None or len(a.text_by_page) != len(texts):
-                    continue
-                trial = list(texts)
-                trial[page - 1] = a.text_by_page[page - 1]
-                if compact_len(trial[page - 1]) > 0 and page not in suspect_pages(trial):
-                    pick[page] = a
-                    texts = trial
-                    break
-        if not pick or best.output is None:
-            return None
+    def _materialize(self, attempts: Sequence[OcrResult], dst_dir: Path, pages_in: int) -> OcrResult:
+        """쪽별 선택(``_plan_pages``)을 결과로 만든다. 한 시도만 고르면 그 시도, 섞이면 쪽을 합친 PDF(재검증)."""
+        first = attempts[0]
+        picks = _plan_pages(attempts)
+        used = sorted(set(picks))
+        if used == [0] or first.output is None:
+            return first
+        if len(used) == 1:
+            res = attempts[used[0]]
+            thr = res.engine.rsplit("=", 1)[-1]
+            res.reason = (res.reason + "; " if res.reason else "") + f"회전 임계값 {thr} 로 재실행한 결과를 채택"
+            return res
         out = dst_dir / f"ocr-{uuid.uuid4().hex[:12]}.pdf"
         try:
-            readers = {id(a): PdfReader(str(a.output), strict=False) for a in [best, *pick.values()]}
+            readers = {k: PdfReader(str(attempts[k].output), strict=False) for k in used}
             writer = PdfWriter()
             for i in range(pages_in):
-                src_attempt = pick.get(i + 1, best)
-                writer.add_page(readers[id(src_attempt)].pages[i])
+                writer.add_page(readers[picks[i]].pages[i])
             with open(out, "wb") as fh:
                 writer.write(fh)
-        except Exception as e:  # 병합 실패는 병합 없이 진행(쪽 단위 보강은 선택 기능)
+        except Exception as e:  # 병합 실패는 첫 시도 결과로 진행(쪽 단위 보강은 선택 기능)
             log.info("ocr merge failed %s", type(e).__name__)
             self._discard(out)
-            return None
-        res = self._verify(out, pages_in, best.engine)
-        if res.output is None or _problem_pages(res) >= _problem_pages(best):
-            self._discard(out)
-            return None
-        res.engine = best.engine + " (쪽 " + _fmt_pages(sorted(pick)) + " 은 다른 회전 임계값 시도에서 가져옴: " + \
-            ",".join(sorted({a.engine.rsplit("=", 1)[-1] for a in pick.values()})) + ")"
+            return first
+        res = self._verify(out, pages_in, first.engine)
+        if res.output is None:  # 병합본 재검증 실패
+            return first
+        moved = sorted(i + 1 for i, k in enumerate(picks) if k != 0)
+        thrs = ",".join(sorted({attempts[k].engine.rsplit("=", 1)[-1] for k in used if k != 0}))
+        res.engine = f"{first.engine} (쪽 {_fmt_pages(moved)} 은 회전 임계값 {thrs} 시도에서 가져옴)"
         res.reason = (res.reason + "; " if res.reason else "") + "쪽별로 회전 임계값 시도 결과를 병합"
         return res
 
@@ -581,14 +608,45 @@ class OcrmypdfEngine:
             pass
 
 
-def _has_suspect(res: OcrResult) -> bool:
-    """결과에 '텍스트는 있으나 읽을 수 없어 보이는 쪽'이 있는지(재시도 조건). 사유 문자열 대신 본문으로 다시 판정."""
-    return bool(suspect_pages(res.text_by_page))
+def _needs_retry(texts: Sequence[str]) -> bool:
+    """다른 회전 임계값으로 다시 읽어 볼 쪽이 있는지: 의심 쪽이 있거나 20자 이상인 쪽의 가독성이 낮을 때.
+
+    빈 쪽(텍스트 0자)은 진짜 빈 쪽과 방향이 어긋나 못 읽은 쪽을 구분할 수 없어 재시도 조건에 넣지 않는다."""
+    if suspect_pages(texts):
+        return True
+    return any(compact_len(t) >= MIN_PAGE_CHARS and page_readability(t) < RETRY_READABILITY for t in texts)
 
 
-def _problem_pages(res: OcrResult) -> int:
-    """문제 쪽 수(텍스트 0자 + 인식 품질 의심). 재시도 결과 비교 기준."""
-    return len(res.empty_pages) + len(suspect_pages(res.text_by_page))
+def _page_scores(texts: Sequence[str]) -> list[float]:
+    """쪽별 점수: 가독성에서 의심 쪽이면 0.5 를 뺀다. 텍스트가 없는 쪽은 0."""
+    sus = set(suspect_pages(texts))
+    return [(page_readability(t) - (0.5 if i + 1 in sus else 0.0)) if compact_len(t) else 0.0
+            for i, t in enumerate(texts)]
+
+
+def _plan_pages(attempts: Sequence[OcrResult]) -> list[int]:
+    """쪽마다 어느 시도(0=첫 시도)의 결과를 쓸지 고른다. 첫 시도보다 ``MERGE_MARGIN`` 이상 점수가 높은 시도만 대체한다.
+
+    첫 시도 쪽이 비어 있으면(0자) 다른 시도의 쪽은 가독성이 ``RETRY_READABILITY`` 이상이고 20자 이상일 때만 쓴다(빈 쪽 복원).
+    비어 있지 않은 쪽의 교체는 길이 하한 없이 점수 마진만 본다(짧은 쪽도 읽을 수 있게 고쳐졌다면 채택).
+    같은 쪽 수의 시도들만 비교한다."""
+    first = attempts[0]
+    n = len(first.text_by_page)
+    picks = [0] * n
+    scores = [_page_scores(a.text_by_page) if len(a.text_by_page) == n else None for a in attempts]
+    for i in range(n):
+        base_empty = compact_len(first.text_by_page[i]) == 0
+        base = scores[0][i]
+        best = base
+        for k in range(1, len(attempts)):
+            ck = compact_len(attempts[k].text_by_page[i])
+            if scores[k] is None or ck == 0 or (base_empty and ck < MIN_PAGE_CHARS):
+                continue
+            sc = scores[k][i]
+            need = RETRY_READABILITY if base_empty else base + MERGE_MARGIN
+            if sc >= need and sc > best:
+                picks[i], best = k, sc
+    return picks
 
 
 def _fmt_pages(pages: Sequence[int]) -> str:
