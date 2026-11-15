@@ -1353,3 +1353,138 @@ def test_pipeline_input_replaced_during_publish_is_not_deleted(tmp_path, monkeyp
     assert f1.read_bytes() == b"%PDF-1.4 replacement scanned later"
     rec = pipe.journal.list()[0]
     assert rec.state == State.HELD
+
+
+def test_pipeline_waiting_stable_reason_and_pypdf_noise_suppressed(tmp_path, capsys, caplog):
+    """손상·암호화 PDF 첫 스캔 시 pypdf stderr 경고가 억제되고, WAITING_STABLE 사유에 파싱 실패 원인이 함께 기록됨을 검증."""
+    from pypdf import PdfReader, PdfWriter
+
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+    in_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) 끝이 잘린 손상 PDF
+    corrupt_pdf = in_dir / "corrupt.pdf"
+    corrupt_pdf.write_bytes(b"%PDF-1.4 truncated without eof")
+
+    # 2) 열기 암호가 걸린 암호화 PDF
+    plain_tmp = tmp_path / "plain.pdf"
+    make_pdf(plain_tmp, "암호 문서")
+    writer = PdfWriter()
+    for page in PdfReader(str(plain_tmp)).pages:
+        writer.add_page(page)
+    writer.encrypt("secret-pw")
+    encrypted_pdf = in_dir / "encrypted.pdf"
+    with open(encrypted_pdf, "wb") as f:
+        writer.write(f)
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT),
+        title_extractor=FakeTitleExtractor(),
+    )
+
+    items = pipe.scan()
+    assert items == []
+
+    # pypdf 의 'EOF marker not found' 등이 stderr 나 로그로 새어 나오지 않아야 함
+    captured = capsys.readouterr()
+    assert "EOF marker not found" not in captured.err
+    assert "EOF marker not found" not in caplog.text
+
+    rec_corrupt = pipe._find_latest_record("corrupt.pdf")
+    rec_encrypted = pipe._find_latest_record("encrypted.pdf")
+    assert rec_corrupt.state == State.WAITING_STABLE
+    assert rec_encrypted.state == State.WAITING_STABLE
+
+    assert rec_corrupt.reason is not None and rec_corrupt.reason != "PDF 파싱 대기(작성 중)"
+    assert "불완전 스트림/EOF 누락" in rec_corrupt.reason
+    assert rec_encrypted.reason is not None and rec_encrypted.reason != "PDF 파싱 대기(작성 중)"
+    assert "암호화 의심" in rec_encrypted.reason
+
+    w_count, w_sec, w_records = pipe.waiting_stable_info()
+    assert w_count == 2
+    assert w_sec > 0
+    assert len(w_records) == 2
+    # WAITING_STABLE 항목이 '아직 스캔되지 않은 신규 파일'로 중복 집계되지 않아야 함
+    assert pipe.unprocessed_count() == 0
+
+
+def test_pipeline_apply_force_review_standalone_applies_only_needs_review(tmp_path):
+    """apply(force_review=True, approve_all=False) 단독 호출 시 검토 필요 항목만 승인·적용됨을 검증."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+
+    make_pdf(in_dir / "normal.pdf", "정상 문서")
+    make_pdf(in_dir / "partial_doc.pdf", "검토 필요 문서")
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=FakeOcrEngine(),
+        title_extractor=FakeTitleExtractor(),
+    )
+    items = pipe.scan()
+    assert len(items) == 2
+
+    # --force-review 단독: needs_review=True 인 partial_doc.pdf 만 적용되고 normal.pdf 는 REVIEW_PENDING 유지
+    res1 = pipe.apply(approve_all=False, force_review=True)
+    assert res1.applied == ["partial_doc.pdf"]
+    assert res1.failed == []
+    assert pipe._find_latest_record("partial_doc.pdf").state == State.COMPLETED
+    assert pipe._find_latest_record("normal.pdf").state == State.REVIEW_PENDING
+
+    # 이후 --approve-all 로 나머지 정상 대기 항목 적용
+    res2 = pipe.apply(approve_all=True, force_review=False)
+    assert res2.applied == ["normal.pdf"]
+    assert pipe._find_latest_record("normal.pdf").state == State.COMPLETED
+
+
+def test_pipeline_waiting_stable_info_excludes_superseded_and_removed(tmp_path):
+    """작성 중이던 파일이 완성되어 새 해시로 후속 스캔되거나 삭제되면 과거 WAITING_STABLE 레코드가 안내에서 제외됨을 검증 (Codex P2)."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+    in_dir.mkdir(parents=True, exist_ok=True)
+
+    f1 = in_dir / "writing.pdf"
+    f1.write_bytes(b"%PDF-1.4 incomplete")
+    f2 = in_dir / "deleted.pdf"
+    f2.write_bytes(b"%PDF-1.4 also incomplete")
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT),
+        title_extractor=FakeTitleExtractor(),
+    )
+
+    pipe.scan()
+    w_count, _, _ = pipe.waiting_stable_info()
+    assert w_count == 2
+
+    # f1 은 작성이 완료되어 정상 PDF 로 바뀜(해시 변경), f2 는 삭제됨
+    make_pdf(f1, "완성된 문서")
+    f2.unlink()
+
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "writing.pdf"
+
+    # 대체된 writing.pdf 과거 레코드와 삭제된 deleted.pdf 레코드 모두 활성 대기 안내에서 제외되어야 함
+    w_count_after, w_sec_after, w_recs_after = pipe.waiting_stable_info()
+    assert w_count_after == 0
+    assert w_sec_after == 0
+    assert w_recs_after == []

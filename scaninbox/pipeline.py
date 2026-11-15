@@ -15,13 +15,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import time
 import uuid
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 from scaninbox.config import Config, validate
 from scaninbox.contracts import (
@@ -59,6 +62,66 @@ log = logging.getLogger("scaninbox.pipeline")
 
 
 _UNSET = object()
+
+
+@contextmanager
+def _suppress_pypdf_noise() -> Iterator[None]:
+    """PDF 파싱 시도 구간에서 pypdf 내부 로거('EOF marker not found' 등) 및 경고가 stderr 로 새지 않게 억제한다."""
+    root_pypdf = logging.getLogger("pypdf")
+    targets = [root_pypdf]
+    for name, lg in list(logging.root.manager.loggerDict.items()):
+        if isinstance(lg, logging.Logger) and name.startswith("pypdf."):
+            targets.append(lg)
+    saved = [(lg, lg.level, lg.propagate, lg.disabled) for lg in targets]
+    try:
+        for lg in targets:
+            lg.setLevel(logging.CRITICAL + 1)
+            lg.propagate = False
+            lg.disabled = True
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        for lg, lvl, prop, dis in saved:
+            lg.setLevel(lvl)
+            lg.propagate = prop
+            lg.disabled = dis
+
+
+def _probe_pdf(path: Path) -> tuple[bool, Optional[str]]:
+    """PDF 재열기 및 파싱 가능 여부를 확인하고, 실패 시 한국어 요약 사유(OCR 본문 미포함)를 반환한다."""
+    with _suppress_pypdf_noise():
+        try:
+            reader = PdfReader(str(path))
+            if reader.is_encrypted:
+                try:
+                    ok = reader.decrypt("")
+                except Exception as dec_err:
+                    return False, f"암호화 의심({type(dec_err).__name__})"
+                if not ok:
+                    return False, "암호화 의심(열기 암호 필요)"
+            if len(reader.pages) >= 0:
+                return True, None
+            return False, "쪽 수 확인 불가"
+        except Exception as err:
+            err_type = type(err).__name__
+            msg = str(err).lower()
+            if (
+                "not been decrypted" in msg
+                or "password" in msg
+                or err_type == "FileNotDecryptedError"
+            ):
+                return False, f"암호화 의심({err_type})"
+            if (
+                "eof marker" in msg
+                or "stream has ended" in msg
+                or "truncated" in msg
+                or err_type == "PdfStreamError"
+            ):
+                return False, f"불완전 스트림/EOF 누락({err_type})"
+            if "empty" in msg or err_type == "EmptyFileError":
+                return False, f"빈 파일({err_type})"
+            return False, f"파싱 실패({err_type})"
 
 
 @dataclass
@@ -202,14 +265,7 @@ class Pipeline:
                         continue
 
                     # 8. stable_seconds & 작성 안정성 검사 (PDF 파싱 검증 및 안정화 대기)
-                    is_valid_pdf = False
-                    try:
-                        reader = PdfReader(str(path))
-                        if len(reader.pages) >= 0:
-                            is_valid_pdf = True
-                    except Exception as err:
-                        is_valid_pdf = False
-                        log.debug("PDF 파싱 불완전: %s (%s)", rel, err)
+                    is_valid_pdf, parse_reason = _probe_pdf(path)
 
                     now_s = time.time()
                     time_since_mod = now_s - st.st_mtime
@@ -222,30 +278,45 @@ class Pipeline:
                             rec = self.journal.transition(
                                 rec.id, State.DISCOVERED, reason="메타데이터 변동으로 안정화 리셋"
                             )
+                            reset_reason = (
+                                f"PDF 파싱 대기(작성 중): {parse_reason} (크기/수정시각 변동)"
+                                if parse_reason
+                                else "파일 크기/수정시각 변동 대기"
+                            )
                             rec = self.journal.transition(
-                                rec.id, State.WAITING_STABLE, size=st.st_size, mtime_ns=st.st_mtime_ns, reason="변동 후 대기"
+                                rec.id,
+                                State.WAITING_STABLE,
+                                size=st.st_size,
+                                mtime_ns=st.st_mtime_ns,
+                                reason=reset_reason,
                             )
                             continue
                         if time_since_mod < self.config.stable_seconds:
                             log.info(
-                                "[%s] 파일 안정화 대기 중 (%0.1fs < %ds)",
+                                "[%s] 파일 안정화 대기 중 (%0.1fs < %ds, 사유: %s)",
                                 rel,
                                 time_since_mod,
                                 self.config.stable_seconds,
+                                rec.reason or parse_reason or "안정화 대기",
                             )
                             continue
                         # 안정화 시간 경과: PDF 파싱 성공했거나, unreadable(암호화/손상)이어도 안정화되었으므로 OCR 사전점검으로 진행!
 
                     elif not is_valid_pdf:
-                        # 최초 발견 또는 DISCOVERED 상태에서 PDF 파싱 실패 -> 메타데이터와 함께 WAITING_STABLE 전이
-                        log.info("[%s] PDF 파싱 불완전(작성/복사 중 의심), 안정화 대기", rel)
+                        # 최초 발견 또는 DISCOVERED 상태에서 PDF 파싱 실패 -> 파싱 실패 원인과 메타데이터를 함께 WAITING_STABLE 에 기록
+                        wait_reason = (
+                            f"PDF 파싱 대기(작성 중): {parse_reason}"
+                            if parse_reason
+                            else "PDF 파싱 대기(작성 중)"
+                        )
+                        log.info("[%s] %s — 안정화 대기", rel, wait_reason)
                         if rec.state == State.DISCOVERED:
                             rec = self.journal.transition(
                                 rec.id,
                                 State.WAITING_STABLE,
                                 size=st.st_size,
                                 mtime_ns=st.st_mtime_ns,
-                                reason="PDF 파싱 대기(작성 중)",
+                                reason=wait_reason,
                             )
                         continue
 
@@ -367,7 +438,8 @@ class Pipeline:
                     tmp_ocr = self.work_dir / f"ocr_{rec.id}_{sha256[:12]}"
                     tmp_ocr.mkdir(parents=True, exist_ok=True)
                     self.journal.renew_lock()
-                    ocr_res = self.ocr_engine.run(bk_target, tmp_ocr, langs=self.langs)
+                    with _suppress_pypdf_noise():
+                        ocr_res = self.ocr_engine.run(bk_target, tmp_ocr, langs=self.langs)
                     self.journal.renew_lock()
 
                     if ocr_res.status == OcrStatus.ENCRYPTED:
@@ -483,22 +555,67 @@ class Pipeline:
         return items
 
     def unprocessed_count(self) -> int:
-        """디스크의 PDF 파일 중 아직 스캔/제안되지 않은 신규 파일 개수 계산 (읽기 전용)."""
+        """디스크의 PDF 파일 중 아직 스캔/제안되지 않은 신규 파일 개수 계산 (읽기 전용).
+
+        WAITING_STABLE 상태인 파일은 이미 스캔되어 안정화 대기 중이므로 신규 미스캔 파일에서 제외하고
+        waiting_stable_info() 로 별도 안내한다.
+        """
         if not self.scan_dir.exists():
             return 0
-        known_rels = {
-            r.input_rel
-            for r in self.journal.list()
-            if r.state not in (State.DISCOVERED, State.WAITING_STABLE)
-        }
+        latest_by_rel: dict[str, FileRecord] = {}
+        for r in self.journal.list():
+            latest_by_rel[nfc(r.input_rel)] = r
         count = 0
         for path in self.scan_dir.rglob("*.pdf"):
             if not path.is_file() or path.is_symlink():
                 continue
             rel = self._relative_key(path)
-            if rel not in known_rels:
+            rec = latest_by_rel.get(nfc(rel))
+            if rec is None or rec.state == State.DISCOVERED:
                 count += 1
         return count
+
+    def waiting_stable_info(self) -> tuple[int, int, list[FileRecord]]:
+        """현재 활성 WAITING_STABLE 항목 수, 남은 최대 대기 시간(초, 올림), 레코드 목록 반환 (읽기 전용).
+
+        동일 경로에 새 해시로 후속 스캔된(대체된) 과거 레코드나 입력 폴더에서 제거된 파일은 제외한다.
+        """
+        latest_by_rel: dict[str, FileRecord] = {}
+        for r in self.journal.list():
+            latest_by_rel[nfc(r.input_rel)] = r
+        records: list[FileRecord] = []
+        for rec in latest_by_rel.values():
+            if rec.state != State.WAITING_STABLE:
+                continue
+            p = self.scan_dir / rec.input_rel
+            try:
+                if not p.is_file() or p.is_symlink():
+                    continue
+            except OSError:
+                continue
+            records.append(rec)
+        if not records:
+            return 0, 0, []
+        now_s = time.time()
+        max_rem = 0.0
+        for rec in records:
+            p = self.scan_dir / rec.input_rel
+            mtime_s: Optional[float] = None
+            try:
+                if p.is_file():
+                    mtime_s = p.stat().st_mtime
+            except OSError:
+                mtime_s = None
+            if mtime_s is None and rec.mtime_ns is not None:
+                mtime_s = rec.mtime_ns / 1_000_000_000.0
+            if mtime_s is None:
+                rem = float(self.config.stable_seconds)
+            else:
+                elapsed = max(0.0, now_s - mtime_s)
+                rem = max(0.0, float(self.config.stable_seconds) - elapsed)
+            if rem > max_rem:
+                max_rem = rem
+        return len(records), int(math.ceil(max_rem)), records
 
     def retry(self, target: str | int) -> FileRecord:
         """HELD 또는 FAILED 상태인 항목을 재시도하기 위해 DISCOVERED 로 전이."""
@@ -606,6 +723,17 @@ class Pipeline:
                 if approve_all:
                     pending = self.journal.list(State.REVIEW_PENDING)
                     candidates.extend(pending)
+                elif force_review:
+                    # --force-review 단독 실행: REVIEW_PENDING 중 needs_review 항목만 승인·적용 대상에 포함
+                    for r in self.journal.list(State.REVIEW_PENDING):
+                        p_data: dict[str, Any] = {}
+                        if r.plan_json:
+                            try:
+                                p_data = json.loads(r.plan_json)
+                            except Exception:
+                                pass
+                        if p_data.get("needs_review"):
+                            candidates.append(r)
 
             applied: list[str] = []
             failed: list[tuple[str, str]] = []

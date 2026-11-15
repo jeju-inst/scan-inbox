@@ -77,7 +77,16 @@ def cmd_init(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
 def cmd_scan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
     pipe = pipeline or _create_pipeline(args, create_dirs=True)
     items = pipe.scan()
-    print(f"스캔 완료: 총 {len(items)}건 발견 및 제안 생성")
+    w_count, w_sec, w_records = pipe.waiting_stable_info()
+    if w_count > 0:
+        print(
+            f"스캔 완료: 총 {len(items)}건 발견 및 제안 생성, "
+            f"안정화 대기 {w_count}건(약 {w_sec}초 후 다시 scan)"
+        )
+        for r in w_records:
+            print(f"  [안정화대기] {r.input_rel} ({r.reason or '안정화 대기'})")
+    else:
+        print(f"스캔 완료: 총 {len(items)}건 발견 및 제안 생성")
     for item in items:
         status_tag = "검토필요" if item.needs_review else "승인가능"
         print(f"  [{status_tag}] {item.input_rel} -> {item.proposed_name}")
@@ -124,6 +133,15 @@ def cmd_plan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
             if it.warnings:
                 print(f"   주의 사항 : {', '.join(it.warnings)}")
 
+    w_count, w_sec, w_records = pipe.waiting_stable_info()
+    if w_count > 0:
+        print(
+            f"\n[안내] 안정화 대기 {w_count}건(약 {w_sec}초 후 다시 scan)이 있습니다. "
+            f"대기 시간 경과 후 'scaninbox scan'을 다시 실행하십시오."
+        )
+        for r in w_records:
+            print(f"  - {r.input_rel}: {r.reason or '안정화 대기'}")
+
     unproc = pipe.unprocessed_count()
     if unproc > 0:
         print(f"\n[안내] 아직 스캔되지 않은 신규 파일 {unproc}건이 대기 중입니다. 'scaninbox scan'으로 처리하십시오.")
@@ -134,14 +152,18 @@ def cmd_plan(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
 def cmd_apply(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
     pipe = pipeline or _create_pipeline(args, create_dirs=True)
     targets = args.files if args.files else None
-    if not targets and not args.approve_all:
-        print("오류: 적용할 파일 목록을 지정하거나 --approve-all 플래그를 사용하십시오.", file=sys.stderr)
+    force_review = getattr(args, "force_review", False)
+    if not targets and not args.approve_all and not force_review:
+        print(
+            "오류: 적용할 파일 목록을 지정하거나 --approve-all 또는 --force-review 플래그를 사용하십시오.",
+            file=sys.stderr,
+        )
         return 1
 
     res = pipe.apply(
         targets=targets,
         approve_all=args.approve_all,
-        force_review=getattr(args, "force_review", False),
+        force_review=force_review,
     )
     if res.applied:
         print(f"적용 완료: {len(res.applied)}건 완료 폴더로 배치 및 입력 정리됨")
@@ -195,6 +217,7 @@ def cmd_undo(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> i
 def cmd_status(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) -> int:
     pipe = pipeline or _create_pipeline(args, create_dirs=False)
     records = pipe.journal.list()
+    w_count, w_sec, w_records = pipe.waiting_stable_info()
     print("=== Scan Inbox 상태 요약 ===")
     counts: dict[str, int] = {}
     for r in records:
@@ -203,7 +226,14 @@ def cmd_status(args: argparse.Namespace, pipeline: Optional[Pipeline] = None) ->
 
     print(f"총 등록 파일: {len(records)}건")
     for st, c in sorted(counts.items()):
-        print(f"  - {st}: {c}건")
+        if st == State.WAITING_STABLE.value and w_count > 0:
+            print(f"  - {st}: {c}건 (안정화 대기 {w_count}건(약 {w_sec}초 후 다시 scan))")
+        else:
+            print(f"  - {st}: {c}건")
+    if w_count > 0:
+        print(f"\n[안내] 안정화 대기 {w_count}건(약 {w_sec}초 후 다시 scan):")
+        for r in w_records:
+            print(f"  - {r.input_rel}: {r.reason or '안정화 대기'}")
     return 0
 
 
@@ -254,8 +284,16 @@ def build_parser() -> argparse.ArgumentParser:
     # apply
     p_apply = subparsers.add_parser("apply", help="승인 항목 확정 배치 및 입력 정리")
     p_apply.add_argument("files", nargs="*", help="적용할 파일 목록 (지정하지 않으면 승인 대기 항목 전체)")
-    p_apply.add_argument("--approve-all", action="store_true", help="검토 대기 항목 일괄 승인 및 적용")
-    p_apply.add_argument("--force-review", action="store_true", help="검토 필요(needs_review) 항목도 강제 승인하여 적용")
+    p_apply.add_argument(
+        "--approve-all",
+        action="store_true",
+        help="검토 대기 항목 일괄 승인 및 적용 (--force-review 와 함께 쓰면 검토 필요 항목도 포함)",
+    )
+    p_apply.add_argument(
+        "--force-review",
+        action="store_true",
+        help="검토 필요(needs_review) 항목 강제 승인 및 적용 (단독 실행 시 검토 필요 항목만 승인·적용, 파일 지정·--approve-all 과 병행 가능)",
+    )
     p_apply.set_defaults(func=cmd_apply)
 
     # retry
