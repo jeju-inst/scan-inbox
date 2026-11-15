@@ -562,23 +562,38 @@ class Pipeline:
         """
         if not self.scan_dir.exists():
             return 0
-        known_rels = {
-            r.input_rel
-            for r in self.journal.list()
-            if r.state != State.DISCOVERED
-        }
+        latest_by_rel: dict[str, FileRecord] = {}
+        for r in self.journal.list():
+            latest_by_rel[nfc(r.input_rel)] = r
         count = 0
         for path in self.scan_dir.rglob("*.pdf"):
             if not path.is_file() or path.is_symlink():
                 continue
             rel = self._relative_key(path)
-            if rel not in known_rels:
+            rec = latest_by_rel.get(nfc(rel))
+            if rec is None or rec.state == State.DISCOVERED:
                 count += 1
         return count
 
     def waiting_stable_info(self) -> tuple[int, int, list[FileRecord]]:
-        """현재 WAITING_STABLE 상태인 항목 수, 남은 최대 대기 시간(초, 올림), 레코드 목록 반환 (읽기 전용)."""
-        records = self.journal.list(State.WAITING_STABLE)
+        """현재 활성 WAITING_STABLE 항목 수, 남은 최대 대기 시간(초, 올림), 레코드 목록 반환 (읽기 전용).
+
+        동일 경로에 새 해시로 후속 스캔된(대체된) 과거 레코드나 입력 폴더에서 제거된 파일은 제외한다.
+        """
+        latest_by_rel: dict[str, FileRecord] = {}
+        for r in self.journal.list():
+            latest_by_rel[nfc(r.input_rel)] = r
+        records: list[FileRecord] = []
+        for rec in latest_by_rel.values():
+            if rec.state != State.WAITING_STABLE:
+                continue
+            p = self.scan_dir / rec.input_rel
+            try:
+                if not p.is_file() or p.is_symlink():
+                    continue
+            except OSError:
+                continue
+            records.append(rec)
         if not records:
             return 0, 0, []
         now_s = time.time()

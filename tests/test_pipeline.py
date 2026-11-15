@@ -1447,3 +1447,44 @@ def test_pipeline_apply_force_review_standalone_applies_only_needs_review(tmp_pa
     res2 = pipe.apply(approve_all=True, force_review=False)
     assert res2.applied == ["normal.pdf"]
     assert pipe._find_latest_record("normal.pdf").state == State.COMPLETED
+
+
+def test_pipeline_waiting_stable_info_excludes_superseded_and_removed(tmp_path):
+    """작성 중이던 파일이 완성되어 새 해시로 후속 스캔되거나 삭제되면 과거 WAITING_STABLE 레코드가 안내에서 제외됨을 검증 (Codex P2)."""
+    in_dir = tmp_path / "in"
+    done_dir = tmp_path / "done"
+    backup_dir = tmp_path / "bk"
+    j_path = tmp_path / "j.sqlite"
+    in_dir.mkdir(parents=True, exist_ok=True)
+
+    f1 = in_dir / "writing.pdf"
+    f1.write_bytes(b"%PDF-1.4 incomplete")
+    f2 = in_dir / "deleted.pdf"
+    f2.write_bytes(b"%PDF-1.4 also incomplete")
+
+    pipe = Pipeline(
+        scan_dir=in_dir,
+        done_dir=done_dir,
+        backup_dir=backup_dir,
+        journal_path=j_path,
+        ocr_engine=FakeOcrEngine(default_status=OcrStatus.ALREADY_TEXT),
+        title_extractor=FakeTitleExtractor(),
+    )
+
+    pipe.scan()
+    w_count, _, _ = pipe.waiting_stable_info()
+    assert w_count == 2
+
+    # f1 은 작성이 완료되어 정상 PDF 로 바뀜(해시 변경), f2 는 삭제됨
+    make_pdf(f1, "완성된 문서")
+    f2.unlink()
+
+    items = pipe.scan()
+    assert len(items) == 1
+    assert items[0].input_rel == "writing.pdf"
+
+    # 대체된 writing.pdf 과거 레코드와 삭제된 deleted.pdf 레코드 모두 활성 대기 안내에서 제외되어야 함
+    w_count_after, w_sec_after, w_recs_after = pipe.waiting_stable_info()
+    assert w_count_after == 0
+    assert w_sec_after == 0
+    assert w_recs_after == []
