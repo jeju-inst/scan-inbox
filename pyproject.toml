@@ -26,6 +26,7 @@ dev = [
 ]
 
 [project.scripts]
+scaninbox = "scaninbox.cli:main"
 scaninbox-corpus = "scaninbox_corpus.generate:main"
 scaninbox-reconcile = "scaninbox_corpus.reconcile:main"
 scaninbox-snapshot = "scaninbox_corpus.snapshot:main"
