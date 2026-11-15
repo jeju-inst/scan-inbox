@@ -323,6 +323,47 @@ def test_retry_not_adopted_when_not_better(fake_env, tmp_path, monkeypatch):
     assert len(list((tp / "out").glob("*.pdf"))) == 1
 
 
+def test_pages_merged_from_attempts_when_no_single_threshold_is_good(fake_env, tmp_path, monkeypatch):
+    """1.2 에서는 2쪽이, 0.5 에서는 3쪽이 깨지는 경우(글꼴·Tesseract 조합): 쪽별로 읽을 수 있는 시도 결과를 합친다."""
+    import scaninbox.ocr as ocr_mod
+    eng, tp = fake_env
+    calls = tp / "calls.txt"
+    monkeypatch.setenv("FAKE_CALLS_FILE", str(calls))
+
+    def fake_suspect(texts):
+        return [i + 1 for i, t in enumerate(texts)
+                if ("page 2 thr=1.2" in t) or ("page 3 thr=0.5" in t)]
+    monkeypatch.setattr(ocr_mod, "suspect_pages", fake_suspect)
+    res = eng.run(_image_only_pdf(tp / "in.pdf", pages=3), tp / "out")
+    assert calls.read_text().split() == ["1.2", "0.5"]
+    assert res.status is OcrStatus.OK, res.reason
+    assert "page 1 thr=1.2" in res.text_by_page[0]
+    assert "page 2 thr=0.5" in res.text_by_page[1]  # 의심이던 2쪽은 0.5 시도에서
+    assert "page 3 thr=1.2" in res.text_by_page[2]  # 0.5 에서 깨진 3쪽은 1.2 시도에서
+    assert "병합" in res.reason and res.page_count_out == 3
+    texts, _ = ocr_mod.extract_pages(res.output)  # 디스크의 PDF 도 같은 텍스트(재검증된 결과)
+    assert texts == res.text_by_page
+    assert len(list((tp / "out").glob("*.pdf"))) == 1  # 시도별 출력은 정리되고 병합본만 남는다
+
+
+def test_no_merge_when_every_attempt_has_the_same_bad_page(fake_env, tmp_path, monkeypatch):
+    import scaninbox.ocr as ocr_mod
+    eng, tp = fake_env
+    monkeypatch.setattr(ocr_mod, "suspect_pages", lambda texts: [2])
+    res = eng.run(_image_only_pdf(tp / "in.pdf", pages=3), tp / "out")
+    assert res.status is OcrStatus.PARTIAL and "병합" not in res.reason
+    assert len(list((tp / "out").glob("*.pdf"))) == 1
+
+
+def test_suspect_pages_flags_low_hangul_garbage_with_some_hangul():
+    """한글 비율이 0.1~0.2 인 쓰레기 쪽(Noto Sans KR 코퍼스, /Rotate 쪽을 낮은 임계값으로 돌린 출력)도 의심으로 본다."""
+    good = "예시시 가상과 현장 점검 결과를 정리함. 2 쪽은 빈 페이지입니다 감사합니다 보고서"
+    garbage = '"2% 10521 23506 lok Mis = 40d HOW by 극 | 니미 0 높 FY Es) te Rc lylvllo'
+    assert suspect_pages([good, good, garbage]) == [3]
+    english = "This is a normal English page about the annual facility report and budget plan"
+    assert suspect_pages([good, good, english]) == []
+
+
 def test_cancel_during_retry_propagates_and_cleans_up(fake_env, tmp_path, monkeypatch):
     import scaninbox.ocr as ocr_mod
     eng, tp = fake_env
@@ -459,3 +500,27 @@ def test_rotate_behavior_with_default_engine(corpus150, tmp_path):
     # 재시도를 끈 엔진도 결과를 낸다. 플랫폼에 따라 3쪽이 의심 쪽으로 드러나거나(Windows) 교정된다(macOS).
     res0 = _real_engine(retry_rotate_thresholds=()).run(src, tmp_path / "out", timeout_s=600)
     assert res0.status is OcrStatus.PARTIAL and {2, 5} <= set(res0.empty_pages)
+
+
+@pytest.mark.parametrize("font_idx", [0, 1, 2])
+def test_rotate_behavior_other_fonts(font_idx, tmp_path, monkeypatch):
+    """코퍼스 글꼴이 달라도 3쪽(이미지 회전)·4쪽(/Rotate)이 모두 읽혀야 한다. ``SCANINBOX_TEST_FONTS`` 에 OS 경로
+    구분자로 TTF 경로들을 주면 글꼴마다 코퍼스를 새로 만들어 시험한다(없으면 skip). 글꼴에 따라 어떤 단일 임계값도
+    두 쪽을 모두 살리지 못하는 조합이 있어 쪽별 병합이 필요함을 보이는 시험이다."""
+    fonts = [f for f in os.environ.get("SCANINBOX_TEST_FONTS", "").split(os.pathsep) if f]
+    if font_idx >= len(fonts):
+        pytest.skip("SCANINBOX_TEST_FONTS 에 글꼴이 부족함")
+    from scaninbox_corpus.content import doc_rotation_case
+    from scaninbox_corpus.generate import generate
+    from scaninbox_corpus.pathutil import extended
+    monkeypatch.setenv("SCANINBOX_FONT", fonts[font_idx])
+    out = extended(tmp_path / "corpus")
+    manifest = generate(out, dpi=150)
+    key = next(f["file"] for f in manifest["files"] if f["category"] == "rotated_blank")
+    src = next(p for p in (Path(out) / "input").rglob("*") if p.is_file()
+               and unicodedata.normalize("NFC", p.relative_to(Path(out) / "input").as_posix()) == key)
+    doc = doc_rotation_case()
+    res = _real_engine().run(src, tmp_path / "ocr", timeout_s=600)
+    assert _recall(_page_truth(doc, 3), res.text_by_page[2]) >= 0.6, res.reason
+    assert _recall(_page_truth(doc, 4), res.text_by_page[3]) >= 0.6, res.reason
+    assert res.status is OcrStatus.PARTIAL and set(res.empty_pages) == {2, 5}  # 빈 쪽만 문제 쪽
