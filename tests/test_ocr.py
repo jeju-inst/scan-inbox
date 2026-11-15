@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,8 +128,10 @@ def _text_pdf(path: Path, pages: int = 1) -> Path:
 
 def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
-        return str(pid) in out
+        # 바이트로 받는다: 한국어 로캘의 tasklist 는 '일치 없음' 안내를 CP949 로 내보내고, PYTHONUTF8=1 에서
+        # text=True 는 이를 UTF-8 로 디코드하다 reader thread 에서 UnicodeDecodeError 가 난다(stdout=None).
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True).stdout or b""
+        return re.search(rb"(?<!\d)%d(?!\d)" % pid, out) is not None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
