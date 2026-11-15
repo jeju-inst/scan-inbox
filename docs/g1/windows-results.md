@@ -55,7 +55,7 @@
 
 사용 중 발견한 비 Windows 항목(코드 수정 없이 보고):
 
-1. **손상·암호화 PDF 가 `waiting_stable` 에 영원히 남습니다.** `scan` 이 21건만 처리하고, 나머지 2건(코퍼스 `corrupt_pdf`·`encrypted_pdf`, 기대 결과 fail)은 journal 에 사유 `PDF 파싱 대기(작성 중)` 인 `waiting_stable` 로 남았습니다. `plan` 은 "아직 스캔되지 않은 신규 파일 2건이 대기 중"이라고만 안내해 사용자가 손상·암호화를 알 수 없고, ledger 에도 `held`/`failed` 로 나오지 않습니다(reconcile 은 입력 보존을 확인하므로 통과). 설계(`docs/G1-DESIGN.md` §2)의 "`encrypted`·`corrupt`·`failed` 는 held/failed 로 입력에 남긴다"와 다릅니다. 첫 `scan` 에서 pypdf 의 `EOF marker not found` 가 그대로 stderr 로 나옵니다.
+1. **손상·암호화 PDF 는 첫 `scan` 에서 `waiting_stable` 로 남고, 안내가 불충분합니다(결함 아님, 안내 문제).** 위 e2e 는 `scan` 을 한 번만 돌렸고 그때 두 파일(코퍼스 `corrupt_pdf`·`encrypted_pdf`, 기대 결과 fail)의 mtime 이 `stable_seconds`(기본 10초)보다 새것이라 파싱 실패 파일이 안정화 대기에 머물렀습니다. 두 파일만 새 입력 폴더에 복사해 `scan` → 15초 대기 → `scan` 을 다시 돌리자 `status` 가 `failed` 1·`held` 1 로 분류됐고 이후 `scan` 은 변화가 없었습니다(설계대로). 남는 문제는 안내입니다: 첫 `scan` 은 "총 0건 발견"으로 끝나고, `plan` 은 "아직 스캔되지 않은 신규 파일 N건이 대기 중"이라고만 하며, `status` 는 `waiting_stable` 로만 보여 "몇 초 후 다시 `scan`" 이라는 안내가 없습니다. 첫 `scan` 에서 pypdf 의 `EOF marker not found` 가 그대로 stderr 로 나옵니다.
 2. `apply --force-review` 는 단독으로 쓰면 "적용할 파일 목록을 지정하거나 `--approve-all` 을 사용하라"며 실패합니다(`--approve-all --force-review` 가 필요). 도움말에 명시가 없습니다.
 3. 한글 제목 추출에 OCR 공백 오인이 보입니다(예: `2026 년 도 예시 사업 추 진계획`). 합성 렌더링·tessdata_fast 기준이라 일반화하지 않지만, 제안 이름에 그대로 반영됩니다.
 
