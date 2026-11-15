@@ -25,9 +25,11 @@ macOS 는 `brew install tesseract-lang` 으로도 설치할 수 있지만, 이�
 
 ```
 python -m venv .venv
-.venv/bin/pip install -e . pytest        # Windows: .venv\Scripts\pip
+.venv/bin/pip install -e '.[dev]'         # Windows: .venv\Scripts\pip install -e ".[dev]"
 TESSDATA_PREFIX=<위 폴더> .venv/bin/python -m pytest -q
 ```
+
+이후 명령은 가상환경을 켜고 실행합니다. macOS·Linux 는 `source .venv/bin/activate`, Windows 는 `.venv\Scripts\activate` 입니다. 켜지 않으면 `scaninbox` 를 찾지 못하거나 다른 곳에 설치된 버전이 실행될 수 있습니다. 실행할 때마다 `TESSDATA_PREFIX` 도 같은 폴더로 지정해야 합니다.
 
 한국어 팩이 연결되면 실제 OCR 코퍼스 e2e 까지 포함해 **skip 없이** 통과해야 합니다 (macOS 217개 통과, 0 skip 확인). 한국어 팩이 없으면 이 e2e 가 skip 됩니다.
 
@@ -50,7 +52,7 @@ scaninbox -i <입력> -d <완료> -b <백업> undo [파일]     # 되돌리기
 - OCR 이 성공한 문서만 완료됩니다. 암호화·손상·실패 문서는 입력 폴더에 그대로 남습니다.
 - 검토가 필요한 항목은 `rename` 으로 이름을 정하거나 `apply --approve-all --force-review` 로 명시 승인해야 합니다.
 - 중단되거나 이상하면 `recover` 를 먼저 실행하세요. 같은 작업을 동시에 두 번 실행하지 마세요(잠금으로 막힙니다).
-- 파일 이름 전체와 OCR 본문은 로그·저널에 저장하지 않습니다.
+- 저널(SQLite)에는 입력 폴더 기준 상대경로(원래 파일명 포함), 해시, 상태, 제안 제목이 저장됩니다. **파일명이 민감하면 저널·백업 폴더도 같은 수준으로 보호하세요.** OCR 본문과 본문 발췌는 저널·로그에 저장하지 않습니다.
 
 ## 5. 알려진 한계 (G1)
 
