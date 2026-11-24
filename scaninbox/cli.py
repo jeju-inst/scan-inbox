@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Sequence
@@ -38,6 +39,19 @@ from scaninbox.journal import (
 from scaninbox.ocr import OcrmypdfEngine
 from scaninbox.pipeline import ApplyResult, Pipeline
 from scaninbox.title import RuleTitleExtractor
+from scaninbox import llm_title
+
+
+def _create_title_extractor(args: argparse.Namespace):
+    """제목 엔진 선택. 기본은 규칙. ``ollama`` 는 지정한 Ollama 서버(사용자 자신의 머신)에 첫 쪽 OCR 텍스트를 보낸다."""
+    engine = getattr(args, "title_engine", None) or os.environ.get("SCANINBOX_TITLE_ENGINE") or "rule"
+    if engine == "rule":
+        return RuleTitleExtractor()
+    if engine == "ollama":
+        url = getattr(args, "ollama_url", None) or os.environ.get("SCANINBOX_OLLAMA_URL") or llm_title.DEFAULT_URL
+        model = getattr(args, "ollama_model", None) or os.environ.get("SCANINBOX_OLLAMA_MODEL") or llm_title.DEFAULT_MODEL
+        return llm_title.OllamaTitleExtractor(url=url, model=model)
+    raise ValueError(f"알 수 없는 제목 엔진: {engine!r} (rule 또는 ollama)")
 
 
 def _create_pipeline(args: argparse.Namespace, create_dirs: bool = False) -> Pipeline:
@@ -53,7 +67,7 @@ def _create_pipeline(args: argparse.Namespace, create_dirs: bool = False) -> Pip
         journal_path=journal_path,
     )
     engine = OcrmypdfEngine()
-    title_ext = RuleTitleExtractor()
+    title_ext = _create_title_extractor(args)
     return Pipeline(
         config=cfg,
         ocr_engine=engine,
@@ -265,6 +279,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-dir", "-i", help="입력 스캔 폴더 경로")
     parser.add_argument("--done-dir", "-d", help="완료 최종본 폴더 경로")
     parser.add_argument("--backup-dir", "-b", help="원본 보관 백업 폴더 경로")
+    parser.add_argument("--title-engine", choices=["rule", "ollama"],
+                        help="제목 제안 엔진 (기본 rule. ollama 는 로컬 LLM, 환경변수 SCANINBOX_TITLE_ENGINE)")
+    parser.add_argument("--ollama-url", help=f"Ollama 서버 주소 (기본 {llm_title.DEFAULT_URL}, 환경변수 SCANINBOX_OLLAMA_URL)")
+    parser.add_argument("--ollama-model", help=f"Ollama 모델 (기본 {llm_title.DEFAULT_MODEL}, 환경변수 SCANINBOX_OLLAMA_MODEL)")
 
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
