@@ -180,7 +180,7 @@ def _tidy_title(line: str) -> str:
 
 def _latin_garbage(line: str) -> bool:
     """한글이 없는 제목 후보가 인식 잡음(손글씨·도장이 만든 'Ja Be elven AVL HA')처럼 보이면 True.
-    영문 제목이면 4자 이상 단어가 둘 이상이고 2자 이하 조각이 3분의 1 이하여야 한다."""
+    영문 제목이면 4자 이상 단어가 하나 이상이고 2자 이하 조각이 3분의 1 이하여야 한다."""
     if _HANGUL_RUN_RE.search(line):
         return False
     words = re.findall(r"[A-Za-z]+", line)
@@ -188,7 +188,7 @@ def _latin_garbage(line: str) -> bool:
         return False
     long_words = [w for w in words if len(w) >= 4]
     short = [w for w in words if len(w) <= 2]
-    return len(long_words) < 2 or len(short) * 3 > len(words) or line.strip().endswith("?")
+    return not long_words or len(short) * 3 > len(words) or line.strip().endswith("?")
 
 
 def _doc_type_prefix(line: str) -> Optional[str]:
@@ -359,6 +359,8 @@ class RuleTitleExtractor:
             cut = _doc_type_prefix(first["line"]) if noise else None
             if cut:
                 title = cut  # '의 결 과 서-| …'처럼 문서 종류어 뒤에 잡음이 붙은 줄은 앞부분만 쓴다
+                # 잘라 낸 뒷부분이 정말 잡음인지는 알 수 없으므로 검토로 넘긴다(제목 후보는 그대로 보여 준다)
+                reasons.append("제목 뒤의 잡음으로 보이는 부분을 잘라 냄(확인 필요)")
             elif noise:
                 reasons.append(noise)
             elif not first["label"] and _latin_garbage(first["line"]):

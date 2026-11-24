@@ -291,11 +291,18 @@ def test_latin_garbage_from_handwriting_is_rejected():
 def test_english_title_still_accepted():
     p = EX.propose(None, ["Quarterly Facilities Maintenance Summary\nThis is fictional.\n"])
     assert p.title == "Quarterly Facilities Maintenance Summary"
+    for t in ["Tax Return", "Lab Report"]:
+        assert EX.propose(None, [t + "\nMarch 5, 2026\nThis document is fictional.\n"]).title == t
 
 
 def test_doc_type_prefix_before_noise_is_used():
     p = EX.propose(None, ["가 상 결 과 서-| QX 잡음 _ zt B\n더 olb 310 mm\n"])
-    assert p.title == "가상결과서"
+    assert p.title == "가상결과서" and any("잘라 냄" in r for r in p.review_reasons)
+
+
+def test_title_with_ampersand_suffix_is_not_silently_shortened():
+    p = EX.propose(None, ["예산 집행 보고 & 향후 계획\n가상 내용\n"])
+    assert p.review_reasons  # 뒷부분을 버렸다면 반드시 검토 사유가 붙어야 한다
 
 
 def test_section_headings_on_later_pages_are_not_multi_document():
