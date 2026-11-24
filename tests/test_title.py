@@ -261,3 +261,46 @@ def test_real_ocr_corpus_end_to_end(tmp_path_factory):
             wrong += _c(p.title) != _c(f["expected_title"])
     assert accepted >= 10
     assert wrong / accepted <= 0.1, (wrong, accepted)  # 오답 자동 승인 비율 10% 이하(macOS 측정은 0)
+
+
+# ---- G3 파일럿에서 드러난 실문서 패턴(내용은 모두 가상으로 다시 만든 것) ---------------------------------------
+
+
+def test_syllable_split_title_is_not_counted_as_long_sentence():
+    # Tesseract kor 가 음절 사이에 띄어쓰기를 끼워 넣어 토큰이 9개 이상이 되는 제목
+    p = EX.propose(None, ["제 3 회 가상 축제 운영 실태 조사 및 개선 방안\nmo\n가상 본문 조각 Xe) QO\n"])
+    assert p.title == "제 3 회 가상 축제 운영 실태 조사 및 개선 방안"
+
+
+def test_form_title_followed_by_handwriting_fragments_is_kept():
+    p = EX.propose(None, ["가상 의견서\n가 하 고.\n니다.\n것\n습니다. 가상 내용\n"])
+    assert p.title == "가상 의견서" and not p.review_reasons
+
+
+def test_short_label_list_is_still_a_form_without_title():
+    p = EX.propose(None, ["성명\n기간\n연락처\n위와 같이 신청 합니다.\n"])
+    assert p.title is None
+
+
+def test_latin_garbage_from_handwriting_is_rejected():
+    for junk in ["Ko Re alpen OVL MA", "AXA. Reel?"]:
+        p = EX.propose(None, [junk + "\n가상 잡음 줄\n"])
+        assert p.title is None and any("영문 조각" in r for r in p.review_reasons), junk
+
+
+def test_english_title_still_accepted():
+    p = EX.propose(None, ["Quarterly Facilities Maintenance Summary\nThis is fictional.\n"])
+    assert p.title == "Quarterly Facilities Maintenance Summary"
+
+
+def test_doc_type_prefix_before_noise_is_used():
+    p = EX.propose(None, ["가 상 결 과 서-| QX 잡음 _ zt B\n더 olb 310 mm\n"])
+    assert p.title == "가상결과서"
+
+
+def test_section_headings_on_later_pages_are_not_multi_document():
+    pages = ["가상 종합계획 보완 추진 상황보고\n가상 내용 정리\n",
+             "추진 현황\n가상 내용\n", "향후 계획\n가상 내용\n"]
+    p = EX.propose(None, pages)
+    assert p.title == "가상 종합계획 보완 추진 상황보고"
+    assert not any("다중 문서" in r for r in p.review_reasons)

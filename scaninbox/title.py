@@ -55,7 +55,7 @@ _DATE_LABEL_RE = re.compile(r"(작\s*성\s*일|신\s*청\s*일|시\s*행\s*일|�
 _HEADER_LINES = 5  # 첫 쪽에서 기관명 줄을 뺀 앞쪽 몇 줄을 '머리 영역'으로 볼지
 
 _TYPE_HINTS = [
-    (re.compile(r"회의(록|결과)?$"), "회의록"), (re.compile(r"(신청서|요청서|확인서|동의서)$"), "서식"),
+    (re.compile(r"회의(록|결과)?$"), "회의록"), (re.compile(r"(신청서|요청서|확인서|동의서|의견서|결과서|진단서|소견서)$"), "서식"),
     (re.compile(r"(계획|계획서|계획\(안\))$"), "계획서"), (re.compile(r"(보고서?|결과)$"), "보고서"),
     (re.compile(r"(안내|통보|공고|알림)$"), "공문"),
     (re.compile(r"(Summary|Report|Guide|Schedule|Notice|Plan|Minutes)$", re.I), None),
@@ -155,6 +155,54 @@ def _title_noise(line: str) -> Optional[str]:
     return None
 
 
+def _word_count(line: str) -> int:
+    """OCR 이 한글 음절 사이에 띄어쓰기를 끼워 넣는 경우('제 107 회 전 국체전')를 고려한 단어 수.
+    한 글자짜리 토큰은 앞 토큰에 붙은 조각으로 보고 세지 않는다."""
+    return sum(1 for t in line.split() if len(t) >= 2)
+
+
+def _tidy_title(line: str) -> str:
+    """연속된 한 글자 한글 토큰이 3개 이상이면('대 외 비') 붙인다. 2개는 단어 경계일 수 있어 둔다. 숫자·라틴 토큰은 건드리지 않는다."""
+    toks = _WS_RE.sub(" ", line).strip().split(" ")
+    out: list[str] = []
+    run: list[str] = []
+    for t in toks + [""]:
+        if re.fullmatch(r"[가-힣]", t):
+            run.append(t)
+            continue
+        if run:
+            out.extend(["".join(run)] if len(run) >= 3 else run)
+            run = []
+        if t:
+            out.append(t)
+    return " ".join(out)
+
+
+def _latin_garbage(line: str) -> bool:
+    """한글이 없는 제목 후보가 인식 잡음(손글씨·도장이 만든 'Ja Be elven AVL HA')처럼 보이면 True.
+    영문 제목이면 4자 이상 단어가 둘 이상이고 2자 이하 조각이 3분의 1 이하여야 한다."""
+    if _HANGUL_RUN_RE.search(line):
+        return False
+    words = re.findall(r"[A-Za-z]+", line)
+    if not words:
+        return False
+    long_words = [w for w in words if len(w) >= 4]
+    short = [w for w in words if len(w) <= 2]
+    return len(long_words) < 2 or len(short) * 3 > len(words) or line.strip().endswith("?")
+
+
+def _doc_type_prefix(line: str) -> Optional[str]:
+    """잡음 기호 앞 부분이 문서 종류어로 끝나는 제목이면 그 부분을 돌려준다."""
+    m = _STRAY_RE.search(line)
+    if not m:
+        return None
+    prefix = _tidy_title(line[:m.start()].rstrip(" -–—_.:")).strip()
+    if len(_compact(prefix)) >= 3 and _HANGUL_RUN_RE.search(prefix) and _doc_type(prefix) is not None \
+            and not _title_noise(prefix):
+        return prefix
+    return None
+
+
 def _title_like(line: str) -> bool:
     c = _compact(line)
     if len(c) < 4 or len(c) > 100:
@@ -163,9 +211,9 @@ def _title_like(line: str) -> bool:
         return False
     if _KO_SENTENCE_END_RE.search(line.strip()) or _KO_SENTENCE_MID_RE.search(line):
         return False  # 한국어 문장 종결 + 마침표는 본문(줄 중간에 문장이 끝나는 경우 포함)
-    if re.search(r"[,，]", line) or len(line.split()) >= 9:
+    if re.search(r"[,，]", line) or _word_count(line) >= 9:
         return False  # 쉼표가 있거나 단어가 아주 많은 줄은 본문 문장일 가능성이 크다(제목이면 검토로 넘어감)
-    if _SENTENCE_END_RE.search(line.strip()) and len(line.split()) >= 5:
+    if _SENTENCE_END_RE.search(line.strip()) and _word_count(line) >= 5:
         return False  # 영어 문장
     return True
 
@@ -173,7 +221,12 @@ def _title_like(line: str) -> bool:
 def _table_like(lines: list[str], i: int) -> bool:
     """후보와 뒤따르는 줄들이 모두 짧은 항목명이면 서식(표·양식)으로 본다."""
     window = lines[i:i + 3]
-    return len(window) >= 3 and all(len(_compact(w)) <= 8 for w in window)
+    if not (len(window) >= 3 and all(len(_compact(w)) <= 8 for w in window)):
+        return False
+    if _doc_type(lines[i]) is not None:
+        return False  # '보호자 의견서'처럼 문서 종류로 끝나는 줄은 아래가 짧은 조각이어도 제목이다
+    # 뒤 줄이 문장 조각(마침표로 끝남)이면 항목명 나열(표)이 아니다
+    return not any(re.search(r"[.。]\s*$", w) for w in window[1:])
 
 
 def _candidates(lines: list[str], *, first_page: bool) -> tuple[list[tuple[int, str]], Optional[str]]:
@@ -236,7 +289,7 @@ def _page_candidate(text: str, *, first_page: bool, repeated: frozenset[str] = f
             return res
         res["ambiguous"] = "기관명으로 보이는 줄뿐이고 제목줄을 찾지 못함"
     others = [c for _, c in cands[1:] if not _title_noise(c)]
-    if others and len(_compact(line)) <= 8:
+    if others and len(_compact(line)) <= 8 and _doc_type(line) is None:
         res["ambiguous"] = "첫 줄이 짧아 기관명일 수 있고 제목 후보가 여러 줄임"
     return res
 
@@ -303,14 +356,19 @@ class RuleTitleExtractor:
             evidence_page = 1
             snippet = _snippet(first["line"])
             noise = _title_noise(first["line"])
-            if noise:
+            cut = _doc_type_prefix(first["line"]) if noise else None
+            if cut:
+                title = cut  # '의 결 과 서-| …'처럼 문서 종류어 뒤에 잡음이 붙은 줄은 앞부분만 쓴다
+            elif noise:
                 reasons.append(noise)
+            elif not first["label"] and _latin_garbage(first["line"]):
+                reasons.append("제목 후보가 인식 잡음으로 보이는 영문 조각임")
             elif first["ambiguous"]:
                 reasons.append(first["ambiguous"])
             elif not first["label"] and not _title_like(first["line"]):
                 reasons.append("제목 후보가 제목답지 않음")
             else:
-                title = _WS_RE.sub(" ", first["line"]).strip()
+                title = _tidy_title(first["line"])
         else:
             reasons.append("제목줄을 찾지 못함(제목 없는 서식이거나 OCR 이 제목을 놓침)")
 
@@ -318,15 +376,15 @@ class RuleTitleExtractor:
         titled_pages = [(pi + 1, _compact(c["line"])) for pi, c in enumerate(cands)
                         if c["line"] and not c["ambiguous"] and not _title_noise(c["line"]) and _title_like(c["line"])]
         distinct = {c for _, c in titled_pages}
-        multi = len(titled_pages) >= 2 and len(distinct) >= 2
-        # 쪽마다 서로 다른 머리 날짜가 반복되는 경우도 보강 신호로 쓴다
+        # 문서 단위로 스캔하는 것이 보통이라(G3 파일럿), 쪽마다 제목 후보가 다른 것만으로는 다중 문서로 보지 않는다.
+        # 한 보고서의 장·절 제목이 쪽마다 다른 제목으로 잡히기 때문이다. 서로 다른 머리 날짜가 함께 있을 때만 의심한다.
         page_dates = []
         for pi, ls in enumerate(pages_lines):
             ds = _header_dates(ls, cands[pi]["idx"])
             if ds:
                 page_dates.append((pi + 1, ds[0] if len(ds) == 1 else None))
         date_distinct = {d for _, d in page_dates if d}
-        multi = multi or (len(date_distinct) >= 2 and len(titled_pages) >= 2)
+        multi = len(date_distinct) >= 2 and len(titled_pages) >= 2 and len(distinct) >= 2
         if multi:
             pg = ",".join(str(p) for p, _ in titled_pages[:5])
             reasons.append(f"다중 문서 의심(쪽 {pg} 에 서로 다른 제목)")
