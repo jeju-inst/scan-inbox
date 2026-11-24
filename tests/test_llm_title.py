@@ -103,6 +103,7 @@ def test_guards():
     assert date_supported("2026-03-05", "26.03.05 작성") == "2026-03-05"
     assert date_supported("2026-03-05", "2026. 3. 15.") is None
     assert date_supported("bad", "2026. 3. 5.") is None
+    assert date_supported("2026-02-30", "작성일 2026. 2. 30.") is None
 
 
 def test_llm_title_with_range_marks_is_filename_safe():
@@ -127,3 +128,20 @@ def test_confident_rule_title_skips_llm(server):
     _Fake.answer = {"title": "다른 제목", "date": None, "confidence": "high"}
     p = _ex(server).propose(None, ["가상 시설 운영 계획\n2026. 3. 5.\n1. 배경: 가상.\n"])
     assert p.title == "가상 시설 운영 계획" and not _Fake.requests
+
+
+@pytest.mark.parametrize("raw", ["[]", '{"response": {"title": "x"}}', '{"other": 1}'])
+def test_unexpected_envelope_falls_back(raw, monkeypatch):
+    import io
+    import urllib.request as ur
+
+    class _R(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(ur, "urlopen", lambda *a, **k: _R(raw.encode()))
+    p = OllamaTitleExtractor(url="http://127.0.0.1:1", model="fake").propose(None, [PAGE])
+    assert LLM_REASON not in p.review_reasons

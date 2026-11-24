@@ -13,10 +13,10 @@ LLM 이 낸 제목에는 항상 검토 사유를 붙여 사용자가 확인하�
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import re
 import sys
-import urllib.error
 import urllib.request
 from typing import Optional, Sequence
 from urllib.parse import urlparse
@@ -63,6 +63,10 @@ def date_supported(date: Optional[str], text: str) -> Optional[str]:
     if not m:
         return None
     y, mo, d = m.group(1), int(m.group(2)), int(m.group(3))
+    try:
+        _dt.date(int(y), mo, d)
+    except ValueError:
+        return None  # 달력에 없는 날짜(2월 30일 등)
     c = _compact(text)
     full = rf"(?<!\d){y}[년.\-/]0?{mo}[월.\-/]0?{d}(?!\d)"
     short = rf"(?<!\d){y[2:]}[.\-/]0?{mo}[.\-/]0?{d}(?!\d)"
@@ -97,9 +101,11 @@ class OllamaTitleExtractor:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
                 resp = json.load(r)
-            out = json.loads(resp.get("response") or "")
+            if not isinstance(resp, dict) or not isinstance(resp.get("response"), str):
+                raise ValueError("unexpected response envelope")
+            out = json.loads(resp["response"])
             return out if isinstance(out, dict) else None
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        except Exception as e:  # noqa: BLE001 - 어떤 실패든 규칙 결과로 돌아간다(스캔을 멈추지 않음)
             if not self._warned:
                 print(f"경고: 로컬 LLM 호출 실패, 규칙 제목만 씁니다 ({type(e).__name__})", file=sys.stderr)
                 self._warned = True
