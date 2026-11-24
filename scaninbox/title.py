@@ -156,7 +156,7 @@ def _title_noise(line: str) -> Optional[str]:
 
 
 def _word_count(line: str) -> int:
-    """OCR 이 한글 음절 사이에 띄어쓰기를 끼워 넣는 경우('제 107 회 전 국체전')를 고려한 단어 수.
+    """OCR 이 한글 음절 사이에 띄어쓰기를 끼워 넣는 경우('제 3 회 가 상축제')를 고려한 단어 수.
     한 글자짜리 토큰은 앞 토큰에 붙은 조각으로 보고 세지 않는다."""
     return sum(1 for t in line.split() if len(t) >= 2)
 
@@ -224,7 +224,7 @@ def _table_like(lines: list[str], i: int) -> bool:
     if not (len(window) >= 3 and all(len(_compact(w)) <= 8 for w in window)):
         return False
     if _doc_type(lines[i]) is not None:
-        return False  # '보호자 의견서'처럼 문서 종류로 끝나는 줄은 아래가 짧은 조각이어도 제목이다
+        return False  # '가상 의견서'처럼 문서 종류로 끝나는 줄은 아래가 짧은 조각이어도 제목이다
     # 뒤 줄이 문장 조각(마침표로 끝남)이면 항목명 나열(표)이 아니다
     return not any(re.search(r"[.。]\s*$", w) for w in window[1:])
 
